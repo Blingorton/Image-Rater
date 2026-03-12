@@ -22,24 +22,43 @@ Ratings can be assigned by using the rating toolbar, number buttons on keyboard,
 
 
 The buttons on the main toolbar are as follows (there are also tooltips built in if you hover your mouse over a button for a second or two):
+
 Open folder
+
 Open current file in windows explorer
+
 Move all files to another folder (subfolders are preserved)
+
 Toggle fit to window
+
 Zoom in
+
 Zoom out
+
 Open thumbnail browser (see below)
+
 Delete all rating 0 (trash) files
+
 Sort files by keywords into subfolders (searches through png metadata for keywords, then sorts your images into subfolders accordingly)
+
 Jump to subfolder (includes jump to last rated image and jump to last viewed image within those subfolders as well)
+
 Show PNG comment metadata
+
 Toggle auto prefix '-'
+
 Rate all '-' as 0 (trash)
+
 Change sort order
+
 Toggle flat mode (ignore subfolders for browsing order)
+
 Settings menu
+
 Then there's the info block, containing the image index within the folder, the image index within it's subfolder as well as the subfolder name, the image's resolution, and the image's rating.
+
 Cycle rating toolbar (top, side, hidden)
+
 
 Thumbnail Viewer
 the thumbnail viewer is also very extensive, mirroring most of the main browser's functions. the main differences are that actions are applied to whatever thumbnail you've clicked on, and the auto prefix with '-' function is replaced with a button that can add or remove that prefix to all images in the folder instead.
