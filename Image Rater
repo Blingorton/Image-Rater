@@ -1,0 +1,3181 @@
+"""
+Image Rater - IrfanView-style image browser with rating/renaming
+Rating prefixes:
+  5 → ____  (orange)   4 → ___  (purple)   3 → __  (blue)
+  2 → _     (green)    1 → =    (white)     0 → zzz_trash_ (red)
+  unrated → -  (auto-applied in single viewer, toggleable)
+
+Requirements: pip install Pillow
+"""
+
+import json, os, queue, random, shutil, struct, subprocess, threading, tkinter as tk
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from tkinter import filedialog, messagebox
+from PIL import Image, ImageTk
+
+# ── Constants ────────────────────────────────────────────────────────────────
+
+DEFAULT_FOLDER  = r"I:\SD outputs"
+SETTINGS_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "image_rater_settings.json")
+
+RATING_PREFIXES = {5:"____", 4:"___", 3:"__", 2:"_", 1:"=", 0:"zzz_trash_"}
+UNRATED_PREFIX  = "-"
+ALL_PREFIXES    = sorted(list(RATING_PREFIXES.values()) + [UNRATED_PREFIX],
+                         key=len, reverse=True)
+
+RATING_COLORS   = {0:"#cc2222", 1:"#dddddd", 2:"#33aa44",
+                   3:"#3366cc", 4:"#883fcc", 5:"#dd7722"}
+
+def rating_prefix(r):
+    """Return file prefix for rating r (handles r > 5).
+    n underscores = rating n+1, so rating r uses r-1 underscores.
+    """
+    if r in RATING_PREFIXES: return RATING_PREFIXES[r]
+    if r > 5: return "_" * (r - 1)  # rating 6 → 5 underscores, etc.
+    return ""
+
+def rating_color(r):
+    """Return display color for rating r (clamps to 0-5 palette)."""
+    return RATING_COLORS[max(0, min(5, r))]
+UNRATED_COLOR   = "#555555"
+
+BG_DARK   = "#1e1e1e"
+BG_PANEL  = "#2d2d2d"
+BG_BTN    = "#444444"
+FG_WHITE  = "#ffffff"
+FG_DIM    = "#888888"
+FG_INFO   = "#cccccc"
+FG_RATING = "#f0c040"
+
+RBAR_H_DEFAULT = 29
+RBAR_H_MIN     = 22
+RBAR_H_MAX     = 120
+
+TB_SIZE_DEFAULT = 140
+TB_SIZE_MIN     = 60
+TB_SIZE_MAX     = 900   # tripled from 300
+TB_BORDER       = 3
+TB_PAD          = 2
+TB_LABEL_H      = 14
+
+SORT_OPTIONS = ["Name", "Rating (Unseen First)", "Rating (Unseen Last)",
+                "Date Modified", "Date Created", "File Size", "Random"]
+
+
+# ── Hotkey defaults ───────────────────────────────────────────────────────────
+# Maps action key -> (description, default_tk_sequence, is_rebindable)
+HOTKEY_DEFAULTS = {
+    "hk_prev":      ("Previous image",           "<Left>",       True),
+    "hk_prev2":     ("Previous image (alt)",      "<BackSpace>",  True),
+    "hk_next":      ("Next image",               "<Right>",      True),
+    "hk_next2":     ("Next image (alt)",          "<space>",      True),
+    "hk_rate_0":    ("Rate as 0 (trash)",         "<Delete>",     True),
+    "hk_rate_0b":   ("Rate as 0 (alt)",           "<grave>",      True),
+    "hk_rate_1":    ("Rate as 1",                 "1",            True),
+    "hk_rate_2":    ("Rate as 2",                 "2",            True),
+    "hk_rate_3":    ("Rate as 3",                 "3",            True),
+    "hk_rate_4":    ("Rate as 4",                 "4",            True),
+    "hk_rate_5":    ("Rate as 5",                 "5",            True),
+    "hk_zoom_in":   ("Zoom in",                   "<equal>",      True),
+    "hk_zoom_out":  ("Zoom out",                  "<minus>",      True),
+    "hk_fit":       ("Toggle fit/native zoom",    "<f>",          True),
+    "hk_tb_zin":    ("TB: larger thumbnails",     "<Control-equal>", True),
+    "hk_tb_zout":   ("TB: smaller thumbnails",    "<Control-minus>", True),
+}
+HOTKEY_FIXED = [
+    ("Mouse Button 4",     "Viewer: rate down / TB: rate down"),
+    ("Mouse Button 5",     "Viewer: rate up / TB: rate up"),
+    ("Mouse Wheel Up",     "Viewer: previous image / TB: scroll"),
+    ("Mouse Wheel Down",   "Viewer: next image / TB: scroll"),
+    ("Ctrl + Wheel",       "TB: zoom thumbnails"),
+]
+
+def get_hk(settings, key):
+    """Return the effective tk sequence for an action."""
+    default = HOTKEY_DEFAULTS[key][1]
+    return settings.get(key, default)
+
+def hk_display(seq):
+    """Convert a tk sequence like <Control-equal> to a readable string."""
+    s = seq.strip("<>")
+    s = s.replace("Control-", "Ctrl+")
+    s = s.replace("Alt-", "Alt+")
+    s = s.replace("Shift-", "Shift+")
+    # Special key names
+    names = {"grave": "`", "equal": "=", "minus": "-", "plus": "+",
+             "space": "Space", "Return": "Enter", "BackSpace": "Backspace",
+             "Delete": "Del", "Escape": "Esc", "Tab": "Tab",
+             "Left": "←", "Right": "→", "Up": "↑", "Down": "↓",
+             "F1":"F1","F2":"F2","F3":"F3","F4":"F4","F5":"F5",
+             "F6":"F6","F7":"F7","F8":"F8","F9":"F9","F10":"F10",
+             "F11":"F11","F12":"F12"}
+    # Handle modifier+key
+    parts = s.split("+")
+    parts[-1] = names.get(parts[-1], parts[-1])
+    return "+".join(parts)
+
+# ── Settings ─────────────────────────────────────────────────────────────────
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_settings(data):
+    try:
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
+def _popup_geom_key(name): return f"popup_geom_{name}"
+
+def restore_popup_geom(window, settings, name, default=None):
+    """Restore saved geometry for a named popup window."""
+    key  = _popup_geom_key(name)
+    geom = settings.get(key)
+    if geom:
+        try: window.geometry(geom); return
+        except Exception: pass
+    if default:
+        try: window.geometry(default)
+        except Exception: pass
+
+def bind_popup_geom(window, settings, name):
+    """Bind geometry saving for a named popup window."""
+    _job = [None]
+    def _save(e=None):
+        if _job[0]: window.after_cancel(_job[0])
+        _job[0] = window.after(400, _do_save)
+    def _do_save():
+        try:
+            settings[_popup_geom_key(name)] = window.geometry()
+            save_settings(settings)
+        except Exception: pass
+    window.bind("<Configure>", _save)
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def strip_prefix(name):
+    base = os.path.basename(name)
+    # Handle extended underscore prefixes (rating > 5) first
+    n = 0
+    for ch in base:
+        if ch == "_": n += 1
+        else: break
+    if n >= 2:
+        return base[n:]
+    # Fixed prefixes
+    for p in ALL_PREFIXES:
+        if base.startswith(p):
+            return base[len(p):]
+    return base
+
+def get_rating_from_name(name):
+    base = os.path.basename(name)
+    # Check non-underscore fixed prefixes first (0=zzz_trash_, 1==)
+    for r in (0, 1):
+        if base.startswith(RATING_PREFIXES[r]):
+            return r
+    # Count leading underscores — n underscores = rating n+1
+    # (1 underscore = rating 2, 2 = rating 3, ..., 4 = rating 5, 5 = rating 6, ...)
+    n = 0
+    for ch in base:
+        if ch == "_": n += 1
+        else: break
+    if n >= 1:
+        return n + 1
+    return None
+
+def is_unrated(name):
+    base = os.path.basename(name)
+    # Has any rating (including >5 underscores)?
+    if get_rating_from_name(base) is not None: return False
+    if base.startswith(UNRATED_PREFIX): return False
+    return True
+
+def has_unrated_prefix(name):
+    return (os.path.basename(name).startswith(UNRATED_PREFIX)
+            and get_rating_from_name(name) is None)
+
+def sort_key_strip(name):
+    return strip_prefix(name).lower()
+
+def _darken(c, f):
+    h = c.lstrip("#")
+    r = max(0, min(255, int(int(h[0:2],16)*f)))
+    g = max(0, min(255, int(int(h[2:4],16)*f)))
+    b = max(0, min(255, int(int(h[4:6],16)*f)))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+def _text_fg_for_bg(bg):
+    h = bg.lstrip("#")
+    r,g,b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
+    lum = 0.299*r + 0.587*g + 0.114*b
+    return "#111111" if lum > 140 else "#ffffff"
+
+def _rating_fg(rating):
+    if rating is None: return FG_WHITE
+    return _text_fg_for_bg(rating_color(rating))
+
+def open_in_explorer(path):
+    if os.path.isfile(path):
+        subprocess.Popen(f'explorer /select,"{path}"')
+    elif os.path.isdir(path):
+        subprocess.Popen(f'explorer "{path}"')
+
+def _rating_sort_key(rel, unseen_first):
+    """Sort key for rating-based sort. Returns (primary_order, name)."""
+    base   = os.path.basename(rel)
+    rating = get_rating_from_name(base)
+    name   = strip_prefix(base).lower()
+    # order: 5,4,3,2,1 then unrated, then 0
+    # unseen_first=True:  truly unrated before "-" prefixed
+    # unseen_first=False: "-" prefixed before truly unrated
+    if rating is not None and rating > 0:
+        primary = 5 - rating          # 0..4
+    elif rating == 0:
+        primary = 7
+    elif is_unrated(base):            # no prefix at all
+        primary = 5 if unseen_first else 6
+    else:                             # has "-" prefix
+        primary = 6 if unseen_first else 5
+    return (primary, name)
+
+def sort_files(files, folder, method):
+    def fp(f): return os.path.join(folder, f)
+    if method == "Name":
+        return sorted(files, key=lambda f: sort_key_strip(os.path.basename(f)))
+    elif method == "Rating (Unseen First)":
+        return sorted(files, key=lambda f: _rating_sort_key(f, True))
+    elif method == "Rating (Unseen Last)":
+        return sorted(files, key=lambda f: _rating_sort_key(f, False))
+    elif method == "Date Modified":
+        return sorted(files, key=lambda f: os.path.getmtime(fp(f)))
+    elif method == "Date Created":
+        return sorted(files, key=lambda f: os.path.getctime(fp(f)))
+    elif method == "File Size":
+        return sorted(files, key=lambda f: os.path.getsize(fp(f)))
+    elif method == "Random":
+        out = list(files); random.shuffle(out); return out
+    return files
+
+def get_png_comment(filepath):
+    result = []
+    try:
+        with open(filepath, "rb") as f:
+            if f.read(8) != b'\x89PNG\r\n\x1a\n': return ""
+            while True:
+                hdr = f.read(8)
+                if len(hdr) < 8: break
+                length = struct.unpack(">I", hdr[:4])[0]
+                ctype  = hdr[4:8]
+                data   = f.read(length); f.read(4)
+                if ctype == b'tEXt':
+                    parts = data.split(b'\x00',1)
+                    if len(parts)==2: result.append(parts[1].decode("latin-1","replace"))
+                elif ctype == b'iTXt':
+                    parts = data.split(b'\x00',1)
+                    if len(parts)==2: result.append(parts[1].decode("utf-8","replace"))
+                elif ctype == b'IEND': break
+    except Exception: pass
+    return " ".join(result)
+
+# ── Tooltip ───────────────────────────────────────────────────────────────────
+
+class Tooltip:
+    def __init__(self, widget, text, delay=1000):
+        self.widget = widget; self.text = text; self.delay = delay
+        self._id = None; self._tip = None
+        widget.bind("<Enter>",  self._schedule)
+        widget.bind("<Leave>",  self._cancel)
+        widget.bind("<Button>", self._cancel)
+
+    def _schedule(self, e=None):
+        self._cancel()
+        self._id = self.widget.after(self.delay, self._show)
+
+    def _cancel(self, e=None):
+        if self._id: self.widget.after_cancel(self._id); self._id = None
+        if self._tip:
+            try: self._tip.destroy()
+            except Exception: pass
+            self._tip = None
+
+    def _show(self):
+        try:
+            x = self.widget.winfo_rootx() + 20
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+            self._tip = tk.Toplevel(self.widget)
+            self._tip.wm_overrideredirect(True)
+            self._tip.wm_geometry(f"+{x}+{y}")
+            tk.Label(self._tip, text=self.text, bg="#ffffcc", fg="#222222",
+                     relief=tk.SOLID, borderwidth=1,
+                     font=("Segoe UI",8), padx=6, pady=3).pack()
+        except Exception: pass
+
+def tip(widget, text):
+    Tooltip(widget, text); return widget
+
+# ── Comment Viewer ────────────────────────────────────────────────────────────
+
+class CommentDialog(tk.Toplevel):
+    """Persistent PNG comment viewer — stays open and tracks current image."""
+    def __init__(self, parent, filepath, settings=None, on_close=None):
+        super().__init__(parent)
+        self.configure(bg=BG_DARK)
+        self.transient(parent)
+        self._settings  = settings or {}
+        self._on_close  = on_close
+        restore_popup_geom(self, self._settings, "comment", "640x400")
+        bind_popup_geom(self, self._settings, "comment")
+        # Text area
+        self._txt = tk.Text(self, bg="#252525", fg=FG_INFO, font=("Segoe UI",9),
+                            relief=tk.FLAT, wrap=tk.WORD, padx=8, pady=8)
+        self._txt.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8,0))
+        bot = tk.Frame(self, bg=BG_DARK); bot.pack(fill=tk.X, pady=6)
+        tk.Button(bot, text="Copy to Clipboard", command=self._copy,
+                  bg=BG_BTN, fg=FG_WHITE, relief=tk.FLAT, font=("Segoe UI",9),
+                  padx=10, pady=4, cursor="hand2").pack(side=tk.LEFT, padx=10)
+        tk.Button(bot, text="Close", command=self._close,
+                  bg=BG_BTN, fg=FG_DIM, relief=tk.FLAT, font=("Segoe UI",9),
+                  padx=10, pady=4, cursor="hand2").pack(side=tk.RIGHT, padx=10)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.update_image(filepath)
+
+    def update_image(self, filepath):
+        """Switch to a different image, refreshing title and content."""
+        self._filepath = filepath
+        self.title(f"Comment – {os.path.basename(filepath)}")
+        comment = get_png_comment(filepath)
+        self._txt.config(state=tk.NORMAL)
+        self._txt.delete("1.0", tk.END)
+        if comment:
+            self._txt.insert("1.0", comment)
+        else:
+            self._txt.insert("1.0", "(no comment metadata)")
+            self._txt.config(fg=FG_DIM)
+            self.after(1, lambda: self._txt.config(fg=FG_INFO))
+
+    def _copy(self):
+        self.clipboard_clear()
+        self.clipboard_append(self._txt.get("1.0", tk.END))
+
+    def _close(self):
+        if self._on_close:
+            try: self._on_close()
+            except Exception: pass
+        self.destroy()
+
+def show_comment_dialog(parent, filepath, settings=None, on_close=None):
+    """Open (or re-use) a CommentDialog. Returns the dialog instance."""
+    dlg = CommentDialog(parent, filepath, settings=settings, on_close=on_close)
+    return dlg
+
+# ── Sort helpers ─────────────────────────────────────────────────────────────
+
+def _run_sort_quick(folder, settings):
+    """Run keyword sort using saved settings rules with no UI. Returns (moved, errors)."""
+    saved = settings.get("sort_rows", [])
+    rules = [(row[0].strip(), (row[1].strip() or row[0].strip()))
+             for row in saved if row[0].strip()]
+    if not rules: return 0, 0
+    moved = errors = 0
+    for fname in [f for f in os.listdir(folder) if f.lower().endswith(".png")]:
+        fpath = os.path.join(folder, fname)
+        comment = get_png_comment(fpath)
+        for kw, fld in rules:
+            if kw.lower() in comment.lower():
+                dest = os.path.join(folder, fld)
+                os.makedirs(dest, exist_ok=True)
+                try: shutil.move(fpath, os.path.join(dest, fname)); moved += 1
+                except Exception: errors += 1
+                break
+    return moved, errors
+
+# ── Sort Dialog ───────────────────────────────────────────────────────────────
+
+class SortDialog(tk.Toplevel):
+    ROWS = 20
+    def __init__(self, parent, folder, settings, reload_cb=None):
+        super().__init__(parent)
+        self.title("Sort by Comment Keywords")
+        self.configure(bg=BG_DARK)
+        self.resizable(True, True)
+        self.transient(parent)
+        self.grab_set()
+        self._folder = folder; self._settings = settings; self._rows = []
+        self._reload_cb = reload_cb
+        self._build_ui(); self._load_saved()
+        restore_popup_geom(self, settings, "sort_kw", "700x560")
+        bind_popup_geom(self, settings, "sort_kw")
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+    def _build_ui(self):
+        hdr = tk.Frame(self, bg=BG_PANEL, pady=6); hdr.pack(fill=tk.X)
+        tk.Label(hdr, text="Search comment for:", bg=BG_PANEL, fg=FG_INFO,
+                 font=("Segoe UI",9,"bold"), width=28, anchor=tk.W).pack(side=tk.LEFT, padx=(12,0))
+        tk.Label(hdr, text="Move to subfolder (blank = use keyword):", bg=BG_PANEL, fg=FG_INFO,
+                 font=("Segoe UI",9,"bold")).pack(side=tk.LEFT, padx=12)
+        body = tk.Frame(self, bg=BG_DARK); body.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+        for i in range(self.ROWS):
+            row = tk.Frame(body, bg=BG_DARK); row.pack(fill=tk.X, pady=1)
+            kv, fv = tk.StringVar(), tk.StringVar()
+            tk.Label(row, text=f"{i+1:2}.", bg=BG_DARK, fg=FG_DIM,
+                     font=("Segoe UI",8), width=3).pack(side=tk.LEFT)
+            tk.Entry(row, textvariable=kv, bg="#333", fg=FG_WHITE,
+                     insertbackground=FG_WHITE, relief=tk.FLAT,
+                     font=("Segoe UI",9), width=28).pack(side=tk.LEFT, padx=(2,6))
+            tk.Entry(row, textvariable=fv, bg="#333", fg=FG_WHITE,
+                     insertbackground=FG_WHITE, relief=tk.FLAT,
+                     font=("Segoe UI",9), width=28).pack(side=tk.LEFT)
+            self._rows.append((kv, fv))
+        bot = tk.Frame(self, bg=BG_PANEL, pady=8); bot.pack(fill=tk.X, side=tk.BOTTOM)
+        tk.Button(bot, text="Sort", command=self._do_sort, bg="#336633", fg=FG_WHITE,
+                  relief=tk.FLAT, font=("Segoe UI",10,"bold"), padx=20, pady=6,
+                  cursor="hand2").pack(side=tk.RIGHT, padx=10)
+        tk.Button(bot, text="Close", command=self._close, bg=BG_BTN, fg=FG_WHITE,
+                  relief=tk.FLAT, font=("Segoe UI",9), padx=12, pady=6,
+                  cursor="hand2").pack(side=tk.RIGHT, padx=4)
+        self._status = tk.Label(bot, text="", bg=BG_PANEL, fg=FG_RATING, font=("Segoe UI",8))
+        self._status.pack(side=tk.LEFT, padx=10)
+
+    def _load_saved(self):
+        saved = self._settings.get("sort_rows", [])
+        for i,(kv,fv) in enumerate(self._rows):
+            if i < len(saved): kv.set(saved[i][0]); fv.set(saved[i][1])
+
+    def _save_rows(self):
+        self._settings["sort_rows"] = [[k.get(),f.get()] for k,f in self._rows]
+        save_settings(self._settings)
+
+    def _do_sort(self):
+        if not self._folder: self._status.config(text="No folder loaded."); return
+        rules = [(k.get().strip(), f.get().strip() or k.get().strip())
+                 for k,f in self._rows if k.get().strip()]
+        if not rules: self._status.config(text="No rules entered."); return
+        self._save_rows()
+        moved = errors = 0
+        for fname in [f for f in os.listdir(self._folder) if f.lower().endswith(".png")]:
+            fpath = os.path.join(self._folder, fname)
+            comment = get_png_comment(fpath)
+            for kw, fld in rules:
+                if kw.lower() in comment.lower():
+                    dest = os.path.join(self._folder, fld)
+                    os.makedirs(dest, exist_ok=True)
+                    try: shutil.move(fpath, os.path.join(dest, fname)); moved += 1
+                    except Exception: errors += 1
+                    break
+        msg = f"Moved {moved} file(s)."
+        if errors: msg += f" {errors} error(s)."
+        self._status.config(text=msg)
+        if moved and self._reload_cb:
+            try: self._reload_cb()
+            except Exception: pass
+            self.after(200, self.destroy)   # brief pause so status is visible, then close
+
+    def _close(self): self._save_rows(); self.destroy()
+
+# ── Order Dialog ──────────────────────────────────────────────────────────────
+
+class OrderDialog(tk.Toplevel):
+    def __init__(self, parent, current, callback, settings=None):
+        super().__init__(parent)
+        self.title("Sort Order"); self.configure(bg=BG_DARK)
+        self.resizable(False, False); self.transient(parent); self.grab_set()
+        self._cb = callback
+        restore_popup_geom(self, settings or {}, "order")
+        if settings: bind_popup_geom(self, settings, "order")
+        tk.Label(self, text="Sort images by:", bg=BG_DARK, fg=FG_INFO,
+                 font=("Segoe UI",10)).pack(padx=20, pady=(16,8))
+        for opt in SORT_OPTIONS:
+            tk.Button(self, text=opt, command=lambda o=opt: self._pick(o),
+                      bg=BG_BTN if opt != current else "#406080",
+                      fg=FG_WHITE, relief=tk.FLAT,
+                      font=("Segoe UI",10), width=22, pady=6, cursor="hand2").pack(padx=20, pady=3)
+        tk.Button(self, text="Cancel", command=self.destroy,
+                  bg=BG_BTN, fg=FG_DIM, relief=tk.FLAT,
+                  font=("Segoe UI",9), pady=4).pack(pady=(8,16))
+
+    def _pick(self, opt): self._cb(opt); self.destroy()
+
+# ── Subfolder Jump Dialog ─────────────────────────────────────────────────────
+
+class SubfolderDialog(tk.Toplevel):
+    def __init__(self, parent, folder, images, jump_cb, settings=None,
+                 jump_to_idx_cb=None):
+        """
+        jump_cb(subdir)       — jump to first image in subdir
+        jump_to_idx_cb(idx)   — jump to image at absolute index in images list
+        """
+        super().__init__(parent)
+        self.title("Subfolders"); self.configure(bg=BG_DARK)
+        self.resizable(True, True); self.transient(parent)
+        restore_popup_geom(self, settings or {}, "subfolder", "480x520")
+        if settings: bind_popup_geom(self, settings, "subfolder")
+
+        self._images         = images
+        self._jump_to_idx_cb = jump_to_idx_cb
+
+        # Build ordered subdir list (preserving order of first appearance)
+        subdirs = []; seen = set()
+        for rel in images:
+            d = os.path.dirname(rel)
+            if d not in seen: seen.add(d); subdirs.append(d)
+        # subdirs[0] may be "" (root); include it for per-folder buttons
+        # but don't show it as a clickable subfolder name
+
+        # ── helpers ───────────────────────────────────────────────────────────
+
+        def _subdir_images(subdir):
+            """Return (global_index, rel) pairs for images in subdir."""
+            return [(i, r) for i, r in enumerate(images)
+                    if os.path.dirname(r) == subdir]
+
+        def _last_seen_idx(img_pairs):
+            """
+            'Last seen' = end of the longest contiguous run of prefixed images
+            starting from the first image in img_pairs.
+            Walk forward while each image has ANY prefix; return the index of
+            the last one before the first gap (or unrated image).
+            Example: -1,-2,__3,-4,-5,_6,_7,_8,9,10,__11 → _8 (index 7 globally)
+            """
+            result = None
+            for gi, rel in img_pairs:
+                base = os.path.basename(rel)
+                if is_unrated(base):   # no prefix at all — stop here
+                    break
+                result = gi            # this one is prefixed; keep advancing
+            return result
+
+        def _last_rated_idx(img_pairs):
+            """
+            'Last rated' = lowest index that has a non-'-' rating prefix.
+            """
+            for gi, rel in img_pairs:
+                base = os.path.basename(rel)
+                if get_rating_from_name(base) is not None:
+                    return gi
+            return None
+
+        def _safe_contiguous_idx(img_pairs):
+            """
+            Highest index N such that images[0..N] in img_pairs all have any prefix.
+            If the very first is unrated, returns its index (jump to it).
+            """
+            result = img_pairs[0][0] if img_pairs else None
+            for gi, rel in img_pairs:
+                base = os.path.basename(rel)
+                if is_unrated(base):
+                    return gi   # first gap — jump here
+                result = gi
+            return result
+
+        def _do_jump_global(target_idx, img_pairs):
+            """Perform jump with gap-warning for 'last rated' mode."""
+            # Check for any truly-unrated image before target in this scope
+            gap_gi = None
+            for gi, rel in img_pairs:
+                if gi >= target_idx: break
+                if is_unrated(os.path.basename(rel)):
+                    gap_gi = gi; break
+
+            if gap_gi is not None:
+                safe_gi   = _safe_contiguous_idx(img_pairs)
+                target_nm = os.path.basename(images[target_idx])
+                safe_nm   = os.path.basename(images[safe_gi])
+                ans = messagebox.askquestion(
+                    "Gap Detected",
+                    f"Warning: #{gap_gi+1} ({os.path.basename(images[gap_gi])}) "
+                    f"has no prefix and may not have been viewed yet.\n\n"
+                    f"Yes → jump to target #{target_idx+1} ({target_nm})\n"
+                    f"No  → jump to last contiguous #{safe_gi+1} ({safe_nm})",
+                    parent=self)
+                if ans == "no":
+                    self.destroy()
+                    jump_to_idx_cb(safe_gi); return
+
+            self.destroy()
+            jump_to_idx_cb(target_idx)
+
+        def _btn_last_seen(img_pairs):
+            idx = _last_seen_idx(img_pairs)
+            if idx is None:
+                messagebox.showinfo("Not Found",
+                    "No prefixed images found in this scope.", parent=self); return
+            self.destroy(); jump_to_idx_cb(idx)
+
+        def _btn_last_rated(img_pairs):
+            idx = _last_rated_idx(img_pairs)
+            if idx is None:
+                messagebox.showinfo("Not Found",
+                    "No rated images found in this scope.", parent=self); return
+            _do_jump_global(idx, img_pairs)
+
+        # ── global buttons (all images) ───────────────────────────────────────
+        tk.Label(self, text="Jump to subfolder:", bg=BG_DARK, fg=FG_INFO,
+                 font=("Segoe UI",9,"bold")).pack(padx=10, pady=(10,2), anchor=tk.W)
+
+        if jump_to_idx_cb:
+            all_pairs = list(enumerate(images))
+            gf = tk.Frame(self, bg=BG_DARK); gf.pack(fill=tk.X, padx=8, pady=(0,6))
+            tip(tk.Button(gf, text="⏭ Last seen (all)",
+                      command=lambda: _btn_last_seen(all_pairs),
+                      bg="#334455", fg=FG_WHITE, relief=tk.FLAT,
+                      font=("Segoe UI",8), pady=3, padx=8, cursor="hand2"),
+                "Jump to end of contiguous prefixed run across all images"
+                ).pack(side=tk.LEFT, padx=(0,4))
+            tip(tk.Button(gf, text="⭐ Last rated (all)",
+                      command=lambda: _btn_last_rated(all_pairs),
+                      bg="#334433", fg=FG_WHITE, relief=tk.FLAT,
+                      font=("Segoe UI",8), pady=3, padx=8, cursor="hand2"),
+                "Jump to first rated image across all images"
+                ).pack(side=tk.LEFT)
+
+        # ── scrollable subfolder list ─────────────────────────────────────────
+        list_frame = tk.Frame(self, bg=BG_DARK)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0,4))
+        vsb = tk.Scrollbar(list_frame, bg=BG_PANEL, troughcolor=BG_DARK)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas = tk.Canvas(list_frame, bg=BG_DARK, highlightthickness=0,
+                           yscrollcommand=vsb.set)
+        canvas.pack(fill=tk.BOTH, expand=True)
+        vsb.config(command=canvas.yview)
+        inner = tk.Frame(canvas, bg=BG_DARK)
+        canvas.create_window((0, 0), window=inner, anchor=tk.NW)
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<MouseWheel>",
+                    lambda e: canvas.yview_scroll(-1*(e.delta//120), "units"))
+
+        for row_i, subdir in enumerate(subdirs):
+            if not subdir: continue   # skip root-level (no subdir name)
+            row_bg = BG_DARK if row_i % 2 == 0 else "#252525"
+            row = tk.Frame(inner, bg=row_bg); row.pack(fill=tk.X, pady=1)
+
+            # Subfolder name — click to jump to first image
+            name_btn = tk.Button(row, text=f"  📁 {subdir}",
+                                  command=lambda d=subdir: (jump_cb(d), self.destroy()),
+                                  bg=row_bg, fg=FG_INFO, relief=tk.FLAT,
+                                  font=("Segoe UI",9), anchor=tk.W,
+                                  cursor="hand2", pady=3)
+            name_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+            if jump_to_idx_cb:
+                sub_pairs = _subdir_images(subdir)
+                tip(tk.Button(row, text="⏭",
+                          command=lambda p=sub_pairs: _btn_last_seen(p),
+                          bg="#223344", fg="#88bbff", relief=tk.FLAT,
+                          font=("Segoe UI",8), padx=6, pady=3, cursor="hand2"),
+                    f"Last seen in {subdir}"
+                    ).pack(side=tk.LEFT, padx=(0,2))
+                tip(tk.Button(row, text="⭐",
+                          command=lambda p=sub_pairs: _btn_last_rated(p),
+                          bg="#223322", fg="#88cc88", relief=tk.FLAT,
+                          font=("Segoe UI",8), padx=6, pady=3, cursor="hand2"),
+                    f"Last rated in {subdir}"
+                    ).pack(side=tk.LEFT, padx=(0,4))
+
+        tk.Button(self, text="Close", command=self.destroy,
+                  bg=BG_BTN, fg=FG_DIM, relief=tk.FLAT,
+                  font=("Segoe UI",9), pady=4).pack(pady=6)
+
+# ── Move Files Dialog ─────────────────────────────────────────────────────────
+
+class MoveFilesDialog(tk.Toplevel):
+    """File-picker-style dialog for selecting a destination folder to move files into."""
+    THUMB = 80; PAD = 4
+
+    def __init__(self, parent, source_folder, settings, done_cb):
+        super().__init__(parent)
+        self.title("Move Files – Choose Destination")
+        self.configure(bg=BG_DARK); self.geometry("960x660")
+        self.transient(parent); self.grab_set()
+        self._source  = source_folder
+        self._settings = settings
+        self._done_cb = done_cb
+        self._thumbs  = {}; self._load_queue = []
+        restore_popup_geom(self, settings, "move_files", "960x660")
+        bind_popup_geom(self, settings, "move_files")
+        start = settings.get("move_dest_folder",
+                             DEFAULT_FOLDER if os.path.isdir(DEFAULT_FOLDER)
+                             else os.path.expanduser("~"))
+        self.current_dir = os.path.normpath(start)
+        self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.after(60, lambda: self._navigate(self.current_dir))
+
+    def _build_ui(self):
+        abar = tk.Frame(self, bg=BG_PANEL, pady=5); abar.pack(fill=tk.X)
+        tip(tk.Button(abar, text="⬆ Up", command=self._go_up, bg=BG_BTN, fg=FG_WHITE,
+                  relief=tk.FLAT, padx=10, pady=4, font=("Segoe UI",9),
+                  cursor="hand2"), "Go to parent folder").pack(side=tk.LEFT, padx=4)
+        self._path_var = tk.StringVar()
+        e = tk.Entry(abar, textvariable=self._path_var, bg="#333", fg=FG_WHITE,
+                     insertbackground=FG_WHITE, relief=tk.FLAT, font=("Segoe UI",9))
+        e.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        e.bind("<Return>", lambda _: self._navigate(self._path_var.get()))
+        tip(tk.Button(abar, text="Go", command=lambda: self._navigate(self._path_var.get()),
+                  bg=BG_BTN, fg=FG_WHITE, relief=tk.FLAT, padx=10, pady=4,
+                  font=("Segoe UI",9), cursor="hand2"), "Navigate to path").pack(side=tk.LEFT, padx=4)
+
+        body = tk.Frame(self, bg=BG_DARK); body.pack(fill=tk.BOTH, expand=True)
+        self._canvas = tk.Canvas(body, bg=BG_DARK, highlightthickness=0)
+        vsb = tk.Scrollbar(body, orient=tk.VERTICAL, command=self._canvas.yview,
+                           bg=BG_PANEL, troughcolor=BG_DARK)
+        self._canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._canvas.pack(fill=tk.BOTH, expand=True)
+        self._canvas.bind("<Configure>", lambda _: self._reflow())
+        self._canvas.bind("<MouseWheel>",
+                          lambda e: self._canvas.yview_scroll(-1*(e.delta//120),"units"))
+        self._grid = tk.Frame(self._canvas, bg=BG_DARK)
+        self._cw   = self._canvas.create_window((0,0), window=self._grid, anchor=tk.NW)
+        self._grid.bind("<Configure>",
+                        lambda _: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
+
+        bot = tk.Frame(self, bg=BG_PANEL, pady=6); bot.pack(fill=tk.X, side=tk.BOTTOM)
+        self._status = tk.Label(bot, text="", bg=BG_PANEL, fg=FG_DIM, font=("Segoe UI",8))
+        self._status.pack(side=tk.LEFT, padx=10)
+        tip(tk.Button(bot, text="Cancel", command=self.destroy, bg=BG_BTN, fg=FG_WHITE,
+                  relief=tk.FLAT, padx=12, pady=4, font=("Segoe UI",9),
+                  cursor="hand2"), "Cancel").pack(side=tk.RIGHT, padx=6)
+        tip(tk.Button(bot, text="Move Files Here", command=self._do_move,
+                  bg="#406080", fg=FG_WHITE, relief=tk.FLAT, padx=12, pady=4,
+                  font=("Segoe UI",9,"bold"), cursor="hand2"),
+            "Move all files from source into this folder").pack(side=tk.RIGHT, padx=4)
+        tip(tk.Button(bot, text="🗑 Rate '-' as Trash → Delete → Move",
+                  command=self._do_rate_trash_move,
+                  bg="#662222", fg=FG_WHITE, relief=tk.FLAT, padx=12, pady=4,
+                  font=("Segoe UI",9,"bold"), cursor="hand2"),
+            "Rate all '-' prefixed files as 0, delete all rating-0 files, then move the rest here"
+            ).pack(side=tk.RIGHT, padx=4)
+
+    def _navigate(self, path):
+        path = os.path.normpath(path)
+        if not os.path.isdir(path): return
+        self._load_queue.clear()
+        self.current_dir = path; self._path_var.set(path)
+        for w in self._grid.winfo_children(): w.destroy()
+        self._thumbs.clear()
+        try: entries = sorted(os.listdir(path))
+        except PermissionError: return
+        subdirs = [e for e in entries if os.path.isdir(os.path.join(path,e))]
+        self._status.config(text=f"{len(subdirs)} subfolders")
+        T, P = self.THUMB, self.PAD
+        cell_w, cell_h = T+P*2, T+P*2+18
+        for dname in subdirs:
+            cell = tk.Frame(self._grid, bg="#383838", width=cell_w, height=cell_h, cursor="hand2")
+            cell.pack_propagate(False)
+            icon = tk.Label(cell, text="📁", bg="#383838", fg="#f0c040", font=("Segoe UI",28))
+            icon.place(x=0, y=P, width=cell_w, height=T)
+            short = dname if len(dname)<=13 else dname[:10]+"…"
+            tk.Label(cell, text=short, bg="#383838", fg=FG_INFO, font=("Segoe UI",7),
+                     wraplength=cell_w-4).place(x=2, y=T+P, width=cell_w-4)
+            for w in (cell, icon):
+                w.bind("<Button-1>", lambda e,d=dname: self._navigate(os.path.join(self.current_dir,d)))
+        self.after(60, self._reflow)
+
+    def _reflow(self):
+        cw = self._canvas.winfo_width() or 860
+        cell_w = self.THUMB + self.PAD*2 + 4
+        cols   = max(1, cw // cell_w)
+        for idx,child in enumerate(self._grid.winfo_children()):
+            r,c = divmod(idx, cols)
+            child.grid(row=r, column=c, padx=self.PAD, pady=self.PAD)
+        self._canvas.itemconfig(self._cw, width=cw)
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+    def _go_up(self):
+        p = os.path.dirname(self.current_dir)
+        if p != self.current_dir: self._navigate(p)
+
+    def _do_rate_trash_move(self):
+        dest = self.current_dir
+        # Count what will happen so the confirmation is informative
+        to_trash = []   # files with '-' prefix → will be rated 0 then deleted
+        already_trash = []  # files already rated 0 → will be deleted
+        for root, dirs, fnames in os.walk(self._source):
+            dirs.sort()
+            for f in fnames:
+                base = os.path.basename(f)
+                if has_unrated_prefix(base):
+                    to_trash.append(os.path.join(root, f))
+                elif get_rating_from_name(base) == 0:
+                    already_trash.append(os.path.join(root, f))
+        total_delete = len(to_trash) + len(already_trash)
+        if not messagebox.askyesno(
+                "Rate → Delete → Move",
+                f"This will perform 3 steps on:\n  {self._source}\n\n"
+                f"  1. Rate all {len(to_trash)} '-' prefixed file(s) as 0 (trash)\n"
+                f"  2. Delete all {total_delete} rating-0 file(s)\n"
+                f"  3. Move remaining files into:\n     {dest}\n\n"
+                f"Deleted files cannot be recovered. Continue?",
+                parent=self): return
+        self._settings["move_dest_folder"] = dest
+        save_settings(self._settings)
+        # Step 1: rename '-' prefixed files to 'zzz_trash_' prefix
+        renamed = rename_err = 0
+        for fpath in to_trash:
+            dirpart  = os.path.dirname(fpath)
+            base     = os.path.basename(fpath)
+            new_base = rating_prefix(0) + strip_prefix(base)
+            new_path = os.path.join(dirpart, new_base)
+            try: os.rename(fpath, new_path); renamed += 1
+            except Exception: rename_err += 1
+        # Step 2: delete all rating-0 files (re-walk to catch newly renamed ones)
+        deleted = del_err = 0
+        for root, dirs, fnames in os.walk(self._source):
+            dirs.sort()
+            for f in fnames:
+                if get_rating_from_name(f) == 0:
+                    try: os.remove(os.path.join(root, f)); deleted += 1
+                    except Exception: del_err += 1
+        # Step 3: move remaining files
+        moved = move_err = 0
+        for root, dirs, fnames in os.walk(self._source):
+            dirs.sort()
+            for f in fnames:
+                src_path = os.path.join(root, f)
+                rel      = os.path.relpath(src_path, self._source)
+                dst_path = os.path.join(dest, rel)
+                os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+                try: shutil.move(src_path, dst_path); moved += 1
+                except Exception: move_err += 1
+        # Delete source folder if now empty
+        msg = (f"Step 1: rated {renamed} file(s) as trash"
+               + (f" ({rename_err} error(s))" if rename_err else "") + "\n"
+               + f"Step 2: deleted {deleted} file(s)"
+               + (f" ({del_err} error(s))" if del_err else "") + "\n"
+               + f"Step 3: moved {moved} file(s)"
+               + (f" ({move_err} error(s))" if move_err else ""))
+        total_errors = rename_err + del_err + move_err
+        if not total_errors:
+            all_empty = all(not fnames
+                            for _, _, fnames in os.walk(self._source))
+            if all_empty:
+                try:
+                    shutil.rmtree(self._source)
+                    msg += "\nSource folder deleted (was empty)."
+                except Exception as ex:
+                    msg += f"\nCould not delete source folder: {ex}"
+        messagebox.showinfo("Complete", msg, parent=self)
+        self._done_cb()
+        self.destroy()
+
+    def _do_move(self):
+        dest = self.current_dir
+        if not messagebox.askyesno("Move Files",
+                f"Move all files from:\n  {self._source}\ninto:\n  {dest}\n\nSubfolder structure will be preserved.",
+                parent=self): return
+        self._settings["move_dest_folder"] = dest
+        save_settings(self._settings)
+        moved = errors = 0
+        for root, dirs, fnames in os.walk(self._source):
+            dirs.sort()
+            for f in fnames:
+                src_path = os.path.join(root, f)
+                rel      = os.path.relpath(src_path, self._source)
+                dst_path = os.path.join(dest, rel)
+                os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+                try: shutil.move(src_path, dst_path); moved += 1
+                except Exception: errors += 1
+        msg = f"Moved {moved} file(s)."
+        if errors: msg += f" {errors} error(s)."
+        # Delete source folder if it is now entirely empty (no files remain)
+        deleted_src = False
+        if not errors:
+            all_empty = True
+            for root, dirs, fnames in os.walk(self._source):
+                if fnames:
+                    all_empty = False; break
+            if all_empty:
+                try:
+                    shutil.rmtree(self._source)
+                    deleted_src = True
+                    msg += f"\nSource folder deleted (was empty)."
+                except Exception as ex:
+                    msg += f"\nCould not delete source folder: {ex}"
+        messagebox.showinfo("Move Complete", msg, parent=self)
+        self._done_cb()
+        self.destroy()
+
+# ── File Picker (threaded thumbnails) ─────────────────────────────────────────
+
+class FilePicker(tk.Toplevel):
+    THUMB   = 96
+    PAD     = 5
+    WORKERS = 6
+
+    def __init__(self, parent, start_dir=None, settings=None):
+        super().__init__(parent)
+        self.title("Open Folder / Image")
+        self.configure(bg=BG_DARK)
+        self.transient(parent); self.grab_set()
+        self._fp_settings = settings or {}
+        restore_popup_geom(self, self._fp_settings, "file_picker", "960x660")
+        bind_popup_geom(self, self._fp_settings, "file_picker")
+
+        self.result_folder = None
+        self.result_index  = 0
+        self.result_file   = None
+        self.result_sort   = None   # None | "quick" | "custom"
+        self._ph_cache     = {}
+        self._pil_cache    = {}
+        self._cells        = []      # (img_lbl|None, fpath|None, is_dir)
+        self._loading      = set()
+        self._result_q     = queue.Queue()
+        self._closed       = False
+        self._png_files    = []
+        self.current_dir   = os.path.normpath(start_dir or os.path.expanduser("~"))
+        self._executor     = ThreadPoolExecutor(max_workers=self.WORKERS)
+
+        self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.after(60, lambda: self._navigate(self.current_dir))
+        self.after(30, self._drain_results)
+
+    def _build_ui(self):
+        abar = tk.Frame(self, bg=BG_PANEL, pady=5); abar.pack(fill=tk.X)
+        tip(tk.Button(abar, text="⬆ Up", command=self._go_up, bg=BG_BTN, fg=FG_WHITE,
+                  relief=tk.FLAT, padx=10, pady=4, font=("Segoe UI",9),
+                  cursor="hand2"), "Go to parent folder").pack(side=tk.LEFT, padx=4)
+        self._path_var = tk.StringVar()
+        e = tk.Entry(abar, textvariable=self._path_var, bg="#333", fg=FG_WHITE,
+                     insertbackground=FG_WHITE, relief=tk.FLAT, font=("Segoe UI",9))
+        e.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        e.bind("<Return>", lambda _: self._navigate(self._path_var.get()))
+        tip(tk.Button(abar, text="Go", command=lambda: self._navigate(self._path_var.get()),
+                  bg=BG_BTN, fg=FG_WHITE, relief=tk.FLAT, padx=10, pady=4,
+                  font=("Segoe UI",9), cursor="hand2"), "Navigate to path").pack(side=tk.LEFT, padx=4)
+
+        body = tk.Frame(self, bg=BG_DARK); body.pack(fill=tk.BOTH, expand=True)
+        self._canvas = tk.Canvas(body, bg=BG_DARK, highlightthickness=0)
+        vsb = tk.Scrollbar(body, orient=tk.VERTICAL, command=self._canvas.yview,
+                           bg=BG_PANEL, troughcolor=BG_DARK)
+        self._canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._canvas.pack(fill=tk.BOTH, expand=True)
+        self._canvas.bind("<Configure>", lambda _: self._reflow())
+        self._canvas.bind("<MouseWheel>",
+                          lambda e: self._canvas.yview_scroll(-1*(e.delta//120),"units"))
+        self._grid = tk.Frame(self._canvas, bg=BG_DARK)
+        self._cw   = self._canvas.create_window((0,0), window=self._grid, anchor=tk.NW)
+        self._grid.bind("<Configure>",
+                        lambda _: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
+
+        bot = tk.Frame(self, bg=BG_PANEL, pady=6); bot.pack(fill=tk.X, side=tk.BOTTOM)
+        self._status = tk.Label(bot, text="", bg=BG_PANEL, fg=FG_DIM, font=("Segoe UI",8))
+        self._status.pack(side=tk.LEFT, padx=10)
+        # Spinner canvas — animated arc while thumbnails are loading
+        self._spinner_canvas = tk.Canvas(bot, width=22, height=22,
+                                          bg=BG_PANEL, highlightthickness=0)
+        self._spinner_canvas.pack(side=tk.LEFT, padx=4)
+        self._spinner_angle = 0
+        self._spinner_arc   = self._spinner_canvas.create_arc(
+            3, 3, 19, 19, start=90, extent=270,
+            outline="#444444", width=2, style="arc")
+        self._spinner_job   = None
+        self._spin()
+        # Right-side buttons in order: Cancel | Open This Folder | Quick Sort | Custom Sort
+        tip(tk.Button(bot, text="Cancel", command=self._cancel, bg=BG_BTN, fg=FG_WHITE,
+                  relief=tk.FLAT, padx=12, pady=4, font=("Segoe UI",9),
+                  cursor="hand2"), "Cancel").pack(side=tk.RIGHT, padx=6)
+        tip(tk.Button(bot, text="Open This Folder", command=self._open_folder,
+                  bg="#406080", fg=FG_WHITE, relief=tk.FLAT, padx=12, pady=4,
+                  font=("Segoe UI",9), cursor="hand2"),
+            "Open this folder starting at the first image").pack(side=tk.RIGHT, padx=4)
+        tip(tk.Button(bot, text="Open & Sort (Quick)", command=self._open_sort_quick,
+                  bg="#405530", fg=FG_WHITE, relief=tk.FLAT, padx=12, pady=4,
+                  font=("Segoe UI",9), cursor="hand2"),
+            "Sort files into subfolders using current keyword rules, then open"
+            ).pack(side=tk.RIGHT, padx=4)
+        tip(tk.Button(bot, text="Open & Sort (Custom)", command=self._open_sort_custom,
+                  bg="#334455", fg=FG_WHITE, relief=tk.FLAT, padx=12, pady=4,
+                  font=("Segoe UI",9), cursor="hand2"),
+            "Open folder then show the Sort by Keywords dialog"
+            ).pack(side=tk.RIGHT, padx=4)
+
+    def _open_sort_quick(self):
+        self.result_folder = self.current_dir
+        self.result_index  = 0
+        self.result_file   = None
+        self.result_sort   = "quick"
+        self._closed = True; self.destroy()
+
+    def _open_sort_custom(self):
+        self.result_folder = self.current_dir
+        self.result_index  = 0
+        self.result_file   = None
+        self.result_sort   = "custom"
+        self._closed = True; self.destroy()
+
+    def _navigate(self, path):
+        path = os.path.normpath(path)
+        if not os.path.isdir(path): return
+        self._loading.clear()
+        self.current_dir = path; self._path_var.set(path)
+        for w in self._grid.winfo_children(): w.destroy()
+        self._cells.clear()
+        try: entries = sorted(os.listdir(path))
+        except PermissionError: return
+        subdirs         = [e for e in entries if os.path.isdir(os.path.join(path,e))]
+        self._png_files = [e for e in entries if e.lower().endswith(".png")]
+        self._status.config(text=f"{len(subdirs)} folders  |  {len(self._png_files)} PNG files")
+        T, P = self.THUMB, self.PAD
+        cell_w, cell_h = T+P*2, T+P*2+18
+        for dname in subdirs:
+            cell = tk.Frame(self._grid, bg="#383838", width=cell_w, height=cell_h, cursor="hand2")
+            cell.pack_propagate(False)
+            icon = tk.Label(cell, text="📁", bg="#383838", fg="#f0c040", font=("Segoe UI",32))
+            icon.place(x=0, y=P, width=cell_w, height=T)
+            short = dname if len(dname)<=13 else dname[:10]+"…"
+            tk.Label(cell, text=short, bg="#383838", fg=FG_INFO, font=("Segoe UI",7),
+                     wraplength=cell_w-4).place(x=2, y=T+P, width=cell_w-4)
+            for w in (cell, icon):
+                w.bind("<Button-1>", lambda e,d=dname: self._navigate(os.path.join(self.current_dir,d)))
+            self._cells.append((None, None, True))
+        for idx, fname in enumerate(self._png_files):
+            fpath = os.path.join(path, fname)
+            cell  = tk.Frame(self._grid, bg="#2a2a2a", width=cell_w, height=cell_h, cursor="hand2")
+            cell.pack_propagate(False)
+            img_lbl = tk.Label(cell, bg="#2a2a2a", text="…", fg=FG_DIM)
+            img_lbl.place(x=P, y=P, width=T, height=T)
+            short = fname if len(fname)<=13 else fname[:10]+"…"
+            tk.Label(cell, text=short, bg="#2a2a2a", fg=FG_INFO, font=("Segoe UI",7),
+                     wraplength=cell_w-4).place(x=2, y=T+P, width=cell_w-4)
+            for w in (cell, img_lbl):
+                w.bind("<Button-1>", lambda e,i=idx: self._pick(i))
+            self._cells.append((img_lbl, fpath, False))
+            # Submit load job
+            if fpath not in self._pil_cache and fpath not in self._loading:
+                self._loading.add(fpath)
+                self._executor.submit(self._load_worker, fpath)
+        self.after(60, self._reflow)
+
+    def _load_worker(self, fpath):
+        if self._closed: return
+        try:
+            pil = Image.open(fpath); pil.load()
+            thumb = pil.copy(); thumb.thumbnail((self.THUMB, self.THUMB), Image.BILINEAR)
+            self._result_q.put(("ok", fpath, thumb))
+        except Exception:
+            self._result_q.put(("err", fpath, None))
+
+    def _spin(self):
+        """Animate the spinner arc while thumbnails are loading."""
+        if self._closed: return
+        if self._loading:
+            self._spinner_angle = (self._spinner_angle - 24) % 360
+            self._spinner_canvas.itemconfig(
+                self._spinner_arc,
+                start=self._spinner_angle,
+                extent=270,
+                outline="#f0c040"
+            )
+        else:
+            # Idle: dim complete circle, no gap
+            self._spinner_canvas.itemconfig(
+                self._spinner_arc,
+                start=90, extent=359, outline="#444444"
+            )
+        self._spinner_job = self.after(50, self._spin)
+
+    def _drain_results(self):
+        if self._closed: return
+        for _ in range(20):
+            try:
+                status, fpath, thumb = self._result_q.get_nowait()
+            except Exception: break
+            self._loading.discard(fpath)
+            if status == "ok":
+                ph = ImageTk.PhotoImage(thumb)
+                self._ph_cache[fpath] = ph
+                # Find widget
+                for img_lbl, fp, is_dir in self._cells:
+                    if fp == fpath and img_lbl and img_lbl.winfo_exists():
+                        img_lbl.config(image=ph, text=""); break
+        self.after(20, self._drain_results)
+
+    def _reflow(self):
+        cw = self._canvas.winfo_width() or 860
+        cell_w = self.THUMB + self.PAD*2 + 4
+        cols   = max(1, cw // cell_w)
+        for idx,child in enumerate(self._grid.winfo_children()):
+            r,c = divmod(idx, cols)
+            child.grid(row=r, column=c, padx=self.PAD, pady=self.PAD)
+        self._canvas.itemconfig(self._cw, width=cw)
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+    def _go_up(self):
+        p = os.path.dirname(self.current_dir)
+        if p != self.current_dir: self._navigate(p)
+
+    def _pick(self, idx):
+        self.result_folder = self.current_dir
+        self.result_index  = idx
+        self.result_file   = self._png_files[idx] if 0 <= idx < len(self._png_files) else None
+        self._closed = True; self.destroy()
+
+    def _open_folder(self):
+        self.result_folder = self.current_dir
+        self.result_index  = 0
+        self.result_file   = None
+        self._closed = True; self.destroy()
+
+    def _cancel(self):
+        self.result_folder = None
+        self.result_file   = None
+        self._closed = True
+        if self._spinner_job:
+            try: self.after_cancel(self._spinner_job)
+            except Exception: pass
+        self.destroy()
+
+# ── Thumbnail Browser ─────────────────────────────────────────────────────────
+
+class ThumbnailBrowser(tk.Toplevel):
+    SEL_COLOR  = "#f0c040"
+    WORKERS    = 8
+    PREFETCH   = 3
+    HEADER_H   = 22   # subfolder header row height
+
+    def __init__(self, parent, folder, images, settings,
+                 jump_cb=None, rename_cb=None, initial_sel=None):
+        super().__init__(parent)
+        self.title("Thumbnail Browser")
+        self.configure(bg=BG_DARK)
+        # NOT transient so main viewer can be on top independently
+
+        self._parent      = parent
+        self.folder       = folder
+        self._all_images  = list(images)   # preserve order from caller
+        self._images      = list(self._all_images)
+        self._selected    = set()
+        self._last_sel    = None
+        self._thumb_size  = settings.get("tb_thumb_size", TB_SIZE_DEFAULT)
+        self._rating_buttons = {}
+        self._settings    = settings
+        self._resize_job  = None
+        self._jump_cb     = jump_cb
+        self._rename_cb   = rename_cb
+        self._sort_method = settings.get("tb_sort", "Name")
+        self._geom_job    = None
+        self._tb_flat     = settings.get("tb_flat", False)
+        self._tb_bar_left = settings.get("tb_bar_left", False)
+
+        # Virtual canvas layout
+        self._cols       = 1
+        self._cell_w     = 1
+        self._cell_h     = 1
+        self._total_h    = 0
+        # Rows list: each entry is either ("img", idx) or ("hdr", subdir_name)
+        self._rows_list  = []
+
+        self._pil_cache  = {}
+        self._ph_cache   = {}
+        self._loading    = set()
+        self._executor   = ThreadPoolExecutor(max_workers=self.WORKERS)
+        self._result_q   = queue.Queue()
+        self._closed     = False
+        self._row_items  = {}   # row_num -> [canvas_item_ids]
+        self._row_indices = {}   # row_num -> [img_idx, ...]
+
+        geom = settings.get("tb_geometry")
+        if geom: self.geometry(geom)
+        else:    self.state("zoomed")
+
+        self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.bind("<Configure>", self._save_geom_debounced)
+
+        self.after(80, lambda: self._full_refresh(scroll_to=initial_sel))
+        self.after(30, self._drain_results)
+
+        # Mouse buttons
+        for btn_num in (4,5,6,7,8,9):
+            try: self._canvas.bind(f"<Button-{btn_num}>",
+                                   lambda e,n=btn_num: self._tb_extra_btn(e,n))
+            except Exception: pass
+
+    def _tb_extra_btn(self, e, num):
+        if num in (4, 8): self._tb_mouse5()
+        elif num in (5, 9): self._tb_mouse4()
+
+    def _tb_mouse4(self):
+        if not self._last_sel: return
+        r = get_rating_from_name(self._last_sel)
+        self._rate_selected_all(1 if r is None else r+1)
+
+    def _tb_mouse5(self):
+        if not self._last_sel: return
+        r = get_rating_from_name(self._last_sel)
+        self._rate_selected_all(0 if r is None else max(0, r-1))
+
+    # ── Geometry save ─────────────────────────────────────────────────────────
+
+    def _save_geom_debounced(self, e=None):
+        if self._geom_job: self.after_cancel(self._geom_job)
+        self._geom_job = self.after(500, self._save_geom)
+
+    def _save_geom(self):
+        try:
+            self._settings["tb_geometry"]   = self.geometry()
+            self._settings["tb_thumb_size"] = self._thumb_size
+            self._settings["tb_sort"]       = self._sort_method
+            self._settings["tb_flat"]       = self._tb_flat
+            self._settings["tb_bar_left"]   = self._tb_bar_left
+            self._settings["tb_bar_h"]      = self._tb_bar_h
+            save_settings(self._settings)
+        except Exception: pass
+
+    def _on_close(self):
+        self._closed = True
+        self._executor.shutdown(wait=False)
+        self._save_geom()
+        self.destroy()
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        # Outer container: toolbar + canvas, direction depends on _tb_bar_left
+        self._outer = tk.Frame(self, bg=BG_DARK)
+        self._outer.pack(fill=tk.BOTH, expand=True)
+        self._tbar_frame = None
+        self._canvas_frame = None
+        self._canvas = None
+        self._vsb    = None
+        self._rebuild_layout()
+
+    def _rebuild_layout(self):
+        # Destroy existing children of _outer
+        for w in self._outer.winfo_children(): w.destroy()
+        self._rating_buttons.clear()
+
+        if self._tb_bar_left:
+            self._tbar_frame = tk.Frame(self._outer, bg=BG_PANEL, padx=4)
+            self._tbar_frame.pack(side=tk.LEFT, fill=tk.Y)
+            self._canvas_frame = tk.Frame(self._outer, bg=BG_DARK)
+            self._canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            self._tb_handle = None
+        else:
+            self._tb_container = tk.Frame(self._outer, bg=BG_PANEL)
+            self._tb_container.pack(side=tk.BOTTOM, fill=tk.X)
+            self._tb_handle = tk.Frame(self._tb_container, bg="#555555", height=5,
+                                        cursor="sb_v_double_arrow")
+            self._tb_handle.pack(side=tk.TOP, fill=tk.X)
+            self._tb_handle.bind("<ButtonPress-1>",   self._tb_grab_start)
+            self._tb_handle.bind("<B1-Motion>",        self._tb_grab_drag)
+            self._tb_handle.bind("<ButtonRelease-1>", self._tb_grab_end)
+            self._tbar_frame = tk.Frame(self._tb_container, bg=BG_PANEL, pady=4)
+            self._tbar_frame.pack(side=tk.TOP, fill=tk.X)
+            self._canvas_frame = tk.Frame(self._outer, bg=BG_DARK)
+            self._canvas_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        self._tb_bg_frames = []   # populated by _build_toolbar
+        self._build_toolbar()
+        self._build_canvas()
+
+    def _build_toolbar(self):
+        tbar = self._tbar_frame
+        self._tb_bg_frames.append(tbar)   # tbar itself tracks bar color
+        BOX  = "#333333"   # dark grey button box color
+        BPAD = 3           # box padding around buttons
+
+        def boxed_btn(text, cmd, btn_bg=BG_BTN, btn_fg=FG_WHITE, box_bg=BOX, tt=""):
+            """Button inside a colored box frame."""
+            if self._tb_bar_left:
+                box = tk.Frame(tbar, bg=box_bg, padx=BPAD, pady=2)
+                box.pack(side=tk.TOP, padx=3, pady=1, fill=tk.X)
+                b = tk.Button(box, text=text, command=cmd, bg=btn_bg, fg=btn_fg,
+                              relief=tk.FLAT, font=("Segoe UI",9),
+                              padx=3, pady=1, cursor="hand2")
+            else:
+                box = tk.Frame(tbar, bg=box_bg, padx=BPAD, pady=BPAD)
+                box.pack(side=tk.LEFT, padx=2, pady=3)
+                b = tk.Button(box, text=text, command=cmd, bg=btn_bg, fg=btn_fg,
+                              relief=tk.FLAT, font=("Segoe UI",11),
+                              padx=4, pady=2, cursor="hand2")
+            b.pack(fill=tk.X if self._tb_bar_left else tk.NONE)
+            if tt: tip(b, tt)
+            return b
+
+        boxed_btn("📂", self._open_folder, tt="Open folder")
+        boxed_btn("🗑", self._delete_trash, btn_bg="#662222", box_bg="#441111", tt="Delete all rating-0 files")
+        boxed_btn("⚙", self._open_sort_dialog, btn_bg="#444466", box_bg="#2a2a44", tt="Sort files by keyword into subfolders")
+        boxed_btn("🗂", self._open_explorer_sel, tt="Open selected file in Windows Explorer")
+        boxed_btn("↕", self._pick_sort, tt="Change sort order")
+        self._flat_box_btn = boxed_btn(
+            "⊟" if self._tb_flat else "⊞",
+            self._toggle_tb_flat,
+            btn_bg="#336633" if self._tb_flat else BG_BTN,
+            box_bg="#224422" if self._tb_flat else BOX,
+            tt="Toggle flat/grouped view")
+        boxed_btn("📁⚙", self._tb_subfolder_jump, tt="Jump to subfolder")
+        boxed_btn("📝", self._show_comment, tt="Show PNG comment metadata")
+        boxed_btn("A:-", self._rename_unrated_popup, tt="Add/remove '-' prefix on unrated images")
+        boxed_btn("→📁", self._move_files, tt="Move all files to another folder")
+        boxed_btn("🔄", self._refresh, tt="Refresh folder")
+        boxed_btn("⚙S", self._open_settings, tt="Open settings")
+        self._bar_side_btn = boxed_btn(
+            "◧" if self._tb_bar_left else "▬",
+            self._toggle_bar_side, tt="Toggle toolbar left/bottom")
+
+        # Rating buttons — box color matches rating color (darkened).
+        # Show 0 through max(5, current+1) so rating above 5 is always reachable.
+        self._rating_buttons = {}
+        _cur_sel_r = get_rating_from_name(self._last_sel) if self._last_sel else None
+        _tb_max_r  = max(5, (_cur_sel_r or 0) + 1)
+        for i in range(_tb_max_r + 1):
+            rc    = rating_color(i)
+            box_c = _darken(rc, 0.55)
+            if self._tb_bar_left:
+                box = tk.Frame(tbar, bg=box_c, padx=BPAD, pady=2)
+                box.pack(side=tk.TOP, padx=3, pady=1, fill=tk.X)
+                b = tk.Button(box, text=str(i), bg=rc, fg=_rating_fg(i),
+                              relief=tk.FLAT, font=("Segoe UI",9,"bold"),
+                              command=lambda r=i: self._rate_selected_all(r),
+                              cursor="hand2", pady=1)
+                b.pack(fill=tk.X)
+            else:
+                box = tk.Frame(tbar, bg=box_c, padx=BPAD, pady=BPAD)
+                box.pack(side=tk.LEFT, padx=2, pady=3)
+                b = tk.Button(box, text=str(i), bg=rc, fg=_rating_fg(i),
+                              relief=tk.FLAT, font=("Segoe UI",13,"bold"),
+                              command=lambda r=i: self._rate_selected_all(r),
+                              cursor="hand2", width=3, pady=2)
+                b.pack()
+            tip(b, f"Rate selected image(s) as {i}")
+            self._rating_buttons[i] = b
+
+        if not self._tb_bar_left:
+            # Right side: size buttons + info panel
+            # Size adjust buttons in dark boxes
+            right = tk.Frame(tbar, bg=BG_PANEL); right.pack(side=tk.RIGHT, pady=3)
+            self._tb_bg_frames.append(right)   # right frame tracks bar color
+            for sym, delta in (("+", +20), ("−", -20)):
+                box = tk.Frame(right, bg=BOX, padx=BPAD, pady=BPAD)
+                box.pack(side=tk.RIGHT, padx=2)
+                tip(tk.Button(box, text=sym,
+                          command=lambda d=delta: self._resize_thumbs(d),
+                          bg=BG_BTN, fg=FG_WHITE, relief=tk.FLAT, font=("Segoe UI",11),
+                          padx=6, pady=2, cursor="hand2"),
+                    "Larger thumbnails" if delta > 0 else "Smaller thumbnails").pack()
+
+            # Info panel — dark grey box, 3-column layout
+            info_box = tk.Frame(tbar, bg="#222222", padx=6, pady=4)
+            info_box.pack(side=tk.RIGHT, padx=6, pady=3)
+            # Col 1: global idx + subfolder idx
+            col1 = tk.Frame(info_box, bg="#222222"); col1.pack(side=tk.LEFT, padx=(0,8))
+            self._tb_info_idx = tk.Label(col1, text="", bg="#222222", fg=FG_RATING,
+                                          font=("Segoe UI",8,"bold"))
+            self._tb_info_idx.pack(anchor=tk.W)
+            self._tb_info_sub = tk.Label(col1, text="", bg="#222222", fg=FG_RATING,
+                                          font=("Segoe UI",7))
+            self._tb_info_sub.pack(anchor=tk.W)
+            # Col 2: subfolder name + resolution
+            col2 = tk.Frame(info_box, bg="#222222"); col2.pack(side=tk.LEFT, padx=(0,8))
+            self._tb_info_subname = tk.Label(col2, text="", bg="#222222", fg=FG_RATING,
+                                              font=("Segoe UI",7))
+            self._tb_info_subname.pack(anchor=tk.W)
+            self._tb_info_res = tk.Label(col2, text="", bg="#222222", fg="#aaaaaa",
+                                          font=("Segoe UI",7))
+            self._tb_info_res.pack(anchor=tk.W)
+            # Col 3: star rating — fixed size frame so toolbar height is stable
+            col3 = tk.Frame(info_box, bg="#222222", width=64, height=34)
+            col3.pack(side=tk.LEFT); col3.pack_propagate(False)
+            self._tb_info_star = tk.Label(col3, text="", bg="#222222", fg=FG_RATING,
+                                           font=("Segoe UI",11,"bold"))
+            self._tb_info_star.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+        else:
+            # Vertical (left) bar layout:
+            # Info box positioned between toggle-bar button and rating buttons.
+            # All buttons already packed above (side=TOP). Now pack info box
+            # before rating buttons by inserting it here — rating buttons
+            # are packed AFTER this block in the shared rating loop above,
+            # but since we're in the else branch that runs AFTER the rating loop,
+            # we need to re-order. Solution: use a container frame approach.
+            # The rating buttons were already packed into tbar; we need the info box
+            # to appear above them visually. Since pack goes top-down in order of
+            # .pack() calls, we must build the info box BEFORE rating buttons.
+            # But the shared code already packed rating buttons. So we use
+            # tbar.pack_slaves() reordering via lower()/raise() — but tkinter
+            # doesn't support that directly for pack.
+            #
+            # Best solution: don't pack rating buttons in shared loop for left mode;
+            # pack them here after the info box. We'll detect left mode in the
+            # rating loop via a flag.
+            #
+            # Since this else block runs AFTER the rating loop has already packed
+            # buttons into tbar, we detach and reattach them after the info box.
+            # Collect the rating button container frames (they were the last packed).
+            rating_boxes = list(tbar.winfo_children())[-6:]   # last 6 are rating boxes
+            for rb in rating_boxes: rb.pack_forget()
+
+            # Info box — compact, fits in narrow vertical bar
+            info_box = tk.Frame(tbar, bg="#222222", padx=3, pady=3)
+            info_box.pack(side=tk.TOP, padx=3, pady=(4,2), fill=tk.X)
+            self._tb_info_idx = tk.Label(info_box, text="", bg="#222222", fg=FG_RATING,
+                                          font=("Segoe UI",7,"bold"), wraplength=58, justify=tk.CENTER)
+            self._tb_info_idx.pack(fill=tk.X)
+            self._tb_info_sub = tk.Label(info_box, text="", bg="#222222", fg=FG_RATING,
+                                          font=("Segoe UI",6), wraplength=58, justify=tk.CENTER)
+            self._tb_info_sub.pack(fill=tk.X)
+            self._tb_info_subname = tk.Label(info_box, text="", bg="#222222", fg=FG_RATING,
+                                              font=("Segoe UI",6), wraplength=58, justify=tk.CENTER)
+            self._tb_info_subname.pack(fill=tk.X)
+            self._tb_info_res = tk.Label(info_box, text="", bg="#222222", fg="#aaaaaa",
+                                          font=("Segoe UI",6), wraplength=58, justify=tk.CENTER)
+            self._tb_info_res.pack(fill=tk.X)
+            self._tb_info_star = tk.Label(info_box, text="", bg="#222222", fg=FG_RATING,
+                                           font=("Segoe UI",7,"bold"), wraplength=58, justify=tk.CENTER)
+            self._tb_info_star.pack(fill=tk.X)
+
+            # Re-pack rating buttons below info box
+            for rb in rating_boxes:
+                rb.pack(side=tk.TOP, padx=3, pady=1, fill=tk.X)
+
+            # Size buttons at bottom
+            for sym, delta in (("−", -20), ("+", +20)):
+                box = tk.Frame(tbar, bg=BOX, padx=BPAD, pady=BPAD)
+                box.pack(side=tk.TOP, padx=3, pady=1, fill=tk.X)
+                tip(tk.Button(box, text=sym,
+                          command=lambda d=delta: self._resize_thumbs(d),
+                          bg=BG_BTN, fg=FG_WHITE, relief=tk.FLAT, font=("Segoe UI",9),
+                          padx=2, pady=1, cursor="hand2"),
+                    "Larger thumbnails" if delta > 0 else "Smaller thumbnails").pack(fill=tk.X)
+
+    def _build_canvas(self):
+        cf = self._canvas_frame
+        self._vsb = tk.Scrollbar(cf, orient=tk.VERTICAL, bg=BG_PANEL, troughcolor=BG_DARK)
+        self._vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._canvas = tk.Canvas(cf, bg=BG_DARK, highlightthickness=0,
+                                  yscrollcommand=self._vsb.set)
+        self._canvas.pack(fill=tk.BOTH, expand=True)
+        self._vsb.config(command=self._on_vscroll)
+
+        self._canvas.bind("<Configure>",        self._on_canvas_configure)
+        self.bind("<MouseWheel>",                self._on_scroll)
+        self._canvas.bind("<Button-1>",          self._on_canvas_click)
+        self._canvas.bind("<Double-Button-1>",   self._on_canvas_dbl)
+        self._canvas.bind("<Shift-Button-1>",    self._on_canvas_shift)
+        self._canvas.bind("<Control-Button-1>",  self._on_canvas_ctrl)
+
+        for i in range(6):
+            self.bind(str(i), lambda e,r=i: self._rate_selected_all(r))
+        try: self.bind(get_hk(self._settings,"hk_tb_zin"),  lambda e: self._resize_thumbs(+20))
+        except Exception: self.bind("<Control-equal>", lambda e: self._resize_thumbs(+20))
+        try: self.bind(get_hk(self._settings,"hk_tb_zout"), lambda e: self._resize_thumbs(-20))
+        except Exception: self.bind("<Control-minus>", lambda e: self._resize_thumbs(-20))
+
+        for btn_num in (4,5,6,7,8,9):
+            try: self._canvas.bind(f"<Button-{btn_num}>",
+                                   lambda e,n=btn_num: self._tb_extra_btn(e,n))
+            except Exception: pass
+
+    def _toggle_bar_side(self):
+        self._tb_bar_left = not self._tb_bar_left
+        self._row_items.clear()
+        self._rebuild_layout()
+        self._full_refresh()
+
+
+    def _tb_grab_start(self, e): self._tb_grab_y = e.y_root
+    def _tb_grab_end(self, e):   self._tb_grab_y = None
+    def _tb_grab_drag(self, e):
+        if self._tb_grab_y is None: return
+        dy = self._tb_grab_y - e.y_root; self._tb_grab_y = e.y_root
+        new_h = max(30, min(200, self._tb_bar_h + dy))
+        if new_h != self._tb_bar_h:
+            self._tb_bar_h = new_h
+            try: self._tbar_frame.config(height=new_h)
+            except Exception: pass
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+
+    def _build_rows_list(self):
+        """Build self._rows_list: list of ('img', idx) or ('hdr', subdir_name)."""
+        self._rows_list = []
+        if self._tb_flat or not any(os.path.dirname(r) for r in self._images):
+            for idx in range(len(self._images)):
+                self._rows_list.append(("img", idx))
+        else:
+            # Group by subfolder in the order they appear in self._images
+            # (preserves sort order within groups, shows headers at group boundaries)
+            seen_dirs = {}   # dir -> header already emitted
+            cur_dir   = None
+            for idx, rel in enumerate(self._images):
+                d = os.path.dirname(rel)
+                if d != cur_dir:
+                    cur_dir = d
+                    if d not in seen_dirs:
+                        seen_dirs[d] = True
+                        self._rows_list.append(("hdr", d if d else "(root)"))
+                self._rows_list.append(("img", idx))
+
+    def _layout(self):
+        cw = self._canvas.winfo_width() or 900
+        T, B, P = self._thumb_size, TB_BORDER, TB_PAD
+        self._cell_w = T + B*2 + P*2
+        self._cell_h = T + TB_LABEL_H + B*2 + P*2
+
+        self._cols = max(1, cw // self._cell_w)
+
+        # Compute virtual row mapping: each entry in _rows_list may span 1 row
+        # but images in a row-group fill cols positions.
+        # We map linear rows to canvas y positions.
+        self._row_y    = {}   # row_num -> y pixel start
+        self._row_type = {}   # row_num -> ('img_row', first_idx) | ('hdr', name)
+
+        self._row_indices = {}   # row_num -> [idx, idx, ...] for img_rows
+
+        y = 0; row_num = 0; cur_row_idxs = []
+        for entry in self._rows_list:
+            if entry[0] == "hdr":
+                if cur_row_idxs:  # close partial image row
+                    self._row_indices[row_num] = cur_row_idxs
+                    y += self._cell_h; row_num += 1; cur_row_idxs = []
+                self._row_y[row_num]    = y
+                self._row_type[row_num] = ("hdr", entry[1])
+                y += self.HEADER_H; row_num += 1
+            else:  # img entry
+                if not cur_row_idxs:
+                    self._row_y[row_num]    = y
+                    self._row_type[row_num] = ("img_row", entry[1])  # first idx stored for compat
+                cur_row_idxs.append(entry[1])
+                if len(cur_row_idxs) >= self._cols:
+                    self._row_indices[row_num] = cur_row_idxs
+                    y += self._cell_h; row_num += 1; cur_row_idxs = []
+        if cur_row_idxs:
+            self._row_indices[row_num] = cur_row_idxs
+            y += self._cell_h; row_num += 1
+
+        self._total_h   = max(y, 1)
+        self._num_rows  = row_num
+        self._canvas.configure(scrollregion=(0, 0, cw, self._total_h))
+
+    def _full_refresh(self, scroll_to=None):
+        self._row_items.clear()
+        self._canvas.delete("all")
+        self._build_rows_list()
+        self._layout()
+        self._draw_visible()
+        n = len(self._images)
+        self.title(f"Thumbnail Browser – {n} images")
+        if scroll_to:
+            self._scroll_to_image(scroll_to)
+        elif self._last_sel:
+            self._scroll_to_image(self._last_sel)
+
+    def _on_canvas_configure(self, e=None):
+        if self._resize_job: self.after_cancel(self._resize_job)
+        self._resize_job = self.after(80, self._full_refresh)
+
+    # ── Virtual draw ──────────────────────────────────────────────────────────
+
+    def _visible_rows(self):
+        vh   = self._canvas.winfo_height() or 600
+        yoff = int(self._canvas.yview()[0] * self._total_h)
+        if not self._row_y: return 0, 0
+        # Find first visible row_num
+        r0 = max(0, self._y_to_row(yoff) - self.PREFETCH)
+        r1 = min(self._num_rows - 1, self._y_to_row(yoff + vh) + self.PREFETCH)
+        return r0, r1
+
+    def _y_to_row(self, y):
+        """Binary-search row_y for the row containing y."""
+        lo, hi = 0, max(0, self._num_rows - 1)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self._row_y.get(mid, self._total_h) <= y:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _draw_visible(self):
+        if not self._images: return
+        r0, r1 = self._visible_rows()
+        keep_r0 = max(0, r0 - 2)
+        keep_r1 = r1 + 2
+        for row in list(self._row_items):
+            if row < keep_r0 or row > keep_r1:
+                for cid in self._row_items.pop(row):
+                    self._canvas.delete(cid)
+        for row in range(r0, r1+1):
+            if row in self._row_items: continue
+            rtype = self._row_type.get(row)
+            if rtype is None: continue
+            if rtype[0] == "hdr":
+                self._draw_header_row(row, rtype[1])
+            else:
+                self._draw_image_row(row, rtype[1])
+        self._request_visible_images(r0, r1)
+
+    def _draw_header_row(self, row, name):
+        cw  = self._canvas.winfo_width() or 900
+        y0  = self._row_y[row]
+        items = []
+        items.append(self._canvas.create_rectangle(
+            0, y0, cw, y0+self.HEADER_H, fill="#333344", outline=""))
+        items.append(self._canvas.create_text(
+            8, y0+self.HEADER_H//2, text=f"📁  {name}",
+            fill=FG_RATING, font=("Segoe UI",9,"bold"), anchor=tk.W))
+        self._row_items[row] = items
+
+    def _draw_image_row(self, row, first_idx):
+        """Draw a full image row; uses _row_indices[row] for the actual idx list."""
+        T, B = self._thumb_size, TB_BORDER
+        y0   = self._row_y[row]
+        items = []
+
+        row_idxs = self._row_indices.get(row, list(range(first_idx, min(first_idx+self._cols, len(self._images)))))
+        for col_off, idx in enumerate(row_idxs):
+            if idx >= len(self._images): break
+            # Verify this idx belongs to this row
+            # (Due to header rows breaking sequences, first_idx may not be contiguous)
+            # We'll trust the caller is correct
+            rel    = self._images[idx]
+            rating = get_rating_from_name(rel)
+            bc     = RATING_COLORS[rating] if rating is not None else UNRATED_COLOR
+            lb_fg  = _text_fg_for_bg(bc)
+
+            x0 = col_off * self._cell_w + TB_PAD
+            xc = x0 + B
+            yc = y0 + B
+            sel = rel in self._selected
+            border_col = self.SEL_COLOR if sel else bc
+
+            r1 = self._canvas.create_rectangle(
+                x0, y0, x0+self._thumb_size+B*2, y0+self._thumb_size+TB_LABEL_H+B*2,
+                fill=border_col, outline="", tags=("cell", f"idx_{idx}"))
+            r2 = self._canvas.create_rectangle(
+                xc, yc, xc+self._thumb_size, yc+self._thumb_size+TB_LABEL_H,
+                fill="#2a2a2a", outline="", tags=("cell", f"idx_{idx}"))
+            r3 = self._canvas.create_text(
+                xc+self._thumb_size//2, yc+self._thumb_size//2,
+                text="…", fill=FG_DIM, font=("Segoe UI",14),
+                tags=("cell", f"idx_{idx}", f"ph_{idx}"))
+            ly = yc + self._thumb_size
+            r4 = self._canvas.create_rectangle(
+                xc, ly, xc+self._thumb_size, ly+TB_LABEL_H,
+                fill=bc, outline="", tags=("cell", f"idx_{idx}"))
+            bare  = strip_prefix(rel)
+            short = bare if len(bare)<=22 else bare[:19]+"…"
+            r5 = self._canvas.create_text(
+                xc+2, ly+TB_LABEL_H//2, text=short,
+                fill=lb_fg, font=("Segoe UI",7), anchor=tk.W,
+                tags=("cell", f"idx_{idx}"))
+            rstr = str(rating) if rating is not None else "·"
+            r6 = self._canvas.create_text(
+                xc+self._thumb_size-2, ly+TB_LABEL_H//2, text=rstr,
+                fill=lb_fg, font=("Segoe UI",7,"bold"), anchor=tk.E,
+                tags=("cell", f"idx_{idx}"))
+            items.extend([r1,r2,r3,r4,r5,r6])
+
+            key = (rel, self._thumb_size)
+            if key in self._ph_cache:
+                self._canvas.delete(r3); items.remove(r3)
+                img_id = self._canvas.create_image(
+                    xc, yc, anchor=tk.NW, image=self._ph_cache[key],
+                    tags=("cell", f"idx_{idx}", f"img_{idx}"))
+                items.append(img_id)
+
+        self._row_items[row] = items
+
+    def _redraw_cell(self, idx):
+        # Find which row contains this idx
+        row = self._idx_to_row(idx)
+        if row is not None and row in self._row_items:
+            for cid in self._row_items.pop(row): self._canvas.delete(cid)
+            rtype = self._row_type.get(row)
+            if rtype and rtype[0] == "img_row":
+                self._draw_image_row(row, rtype[1])
+
+    def _idx_to_row(self, idx):
+        """Find the canvas row_num containing image index idx."""
+        for row_num, idxs in self._row_indices.items():
+            if idx in idxs:
+                return row_num
+        return None
+
+    # ── Image loading ─────────────────────────────────────────────────────────
+
+    def _request_visible_images(self, r0, r1):
+        for row in range(r0, r1+1):
+            rtype = self._row_type.get(row)
+            if not rtype or rtype[0] != "img_row": continue
+            for idx in self._row_indices.get(row, []):
+                if idx >= len(self._images): break
+                rel  = self._images[idx]
+                key  = (rel, self._thumb_size)
+                if key in self._ph_cache: continue
+                if rel in self._loading: continue
+                self._loading.add(rel)
+                fpath = os.path.join(self.folder, rel)
+                self._executor.submit(self._load_image_worker, rel, fpath, self._thumb_size)
+
+    def _load_image_worker(self, rel, fpath, T):
+        if self._closed: return
+        try:
+            pil = self._pil_cache.get(rel)
+            if pil is None:
+                pil = Image.open(fpath); pil.load()
+                self._pil_cache[rel] = pil
+            thumb = pil.copy(); thumb.thumbnail((T,T), Image.BILINEAR)
+            self._result_q.put(("ok", rel, T, thumb))
+        except Exception:
+            self._result_q.put(("err", rel, T, None))
+
+    def _drain_results(self):
+        if self._closed: return
+        for _ in range(40):
+            try: status, rel, T, thumb = self._result_q.get_nowait()
+            except Exception: break
+            self._loading.discard(rel)
+            key = (rel, T)
+            if status == "ok" and T == self._thumb_size:
+                ph = ImageTk.PhotoImage(thumb)
+                self._ph_cache[key] = ph
+                try:
+                    idx = self._images.index(rel)
+                    self._redraw_cell(idx)
+                except ValueError: pass
+        self.after(20, self._drain_results)
+
+    # ── Scroll ────────────────────────────────────────────────────────────────
+
+    def _on_vscroll(self, *args):
+        self._canvas.yview(*args); self._draw_visible()
+
+    def _on_scroll(self, event):
+        if event.state & 0x4:
+            self._resize_thumbs(20 if event.delta > 0 else -20)
+        else:
+            self._canvas.yview_scroll(-1*(event.delta//120), "units")
+            self._draw_visible()
+
+    def _resize_thumbs(self, delta):
+        new = max(TB_SIZE_MIN, min(TB_SIZE_MAX, self._thumb_size + delta))
+        if new == self._thumb_size: return
+        self._thumb_size = new
+        self._ph_cache.clear(); self._loading.clear()
+        if self._resize_job: self.after_cancel(self._resize_job)
+        self._resize_job = self.after(80, self._full_refresh)
+
+    def _scroll_to_image(self, rel):
+        """Scroll canvas so the cell for 'rel' is visible."""
+        try:
+            idx = self._images.index(rel)
+        except ValueError: return
+        row = self._idx_to_row(idx)
+        if row is None: return
+        y = self._row_y.get(row, 0)
+        frac = y / max(1, self._total_h)
+        self._canvas.yview_moveto(frac)
+        self._draw_visible()
+
+    def _scroll_to_subdir(self, subdir):
+        """Scroll to the header row for subdir."""
+        for row_num, rtype in self._row_type.items():
+            if rtype[0] == "hdr" and (rtype[1] == subdir or rtype[1] == "(root)" and not subdir):
+                y = self._row_y.get(row_num, 0)
+                frac = y / max(1, self._total_h)
+                self._canvas.yview_moveto(frac)
+                self._draw_visible()
+                return
+
+    # ── Hit-testing ───────────────────────────────────────────────────────────
+
+    def _canvas_xy_to_idx(self, cx, cy):
+        cy_abs = cy + int(self._canvas.yview()[0] * self._total_h)
+        row = self._y_to_row(cy_abs)
+        rtype = self._row_type.get(row)
+        if not rtype or rtype[0] != "img_row": return -1
+        first = rtype[1]
+        col   = cx // self._cell_w
+        if col >= self._cols: return -1
+        idx = first + col
+        if idx >= len(self._images): return -1
+        return idx
+
+    def _on_canvas_click(self, e):
+        idx = self._canvas_xy_to_idx(e.x, e.y)
+        if idx < 0: return
+        self._single_select(self._images[idx])
+
+    def _on_canvas_dbl(self, e):
+        idx = self._canvas_xy_to_idx(e.x, e.y)
+        if idx < 0: return
+        rel = self._images[idx]
+        self._single_select(rel)
+        if self._jump_cb:
+            self._jump_cb(rel)
+            # Bring main viewer to front
+            try: self._parent.lift(); self._parent.focus_force()
+            except Exception: pass
+
+    def _on_canvas_shift(self, e):
+        idx = self._canvas_xy_to_idx(e.x, e.y)
+        if idx < 0: return
+        fname = self._images[idx]
+        if not self._last_sel or self._last_sel not in self._images:
+            self._single_select(fname); return
+        i1 = self._images.index(self._last_sel); i2 = idx
+        lo, hi = min(i1,i2), max(i1,i2)
+        old_sel = set(self._selected)
+        self._selected = set(self._images[lo:hi+1])
+        for rel in old_sel ^ self._selected:
+            try: self._redraw_cell(self._images.index(rel))
+            except ValueError: pass
+        self._highlight_rating_button(get_rating_from_name(fname))
+        self._update_tb_info(fname)
+
+    def _on_canvas_ctrl(self, e):
+        idx = self._canvas_xy_to_idx(e.x, e.y)
+        if idx < 0: return
+        rel = self._images[idx]
+        if rel in self._selected: self._selected.discard(rel)
+        else: self._selected.add(rel)
+        self._last_sel = rel
+        self._redraw_cell(idx)
+        self._highlight_rating_button(get_rating_from_name(rel))
+        self._update_tb_info(rel)
+
+    def _single_select(self, rel):
+        old_sel = set(self._selected)
+        self._selected = {rel}; self._last_sel = rel
+        for r in old_sel ^ self._selected:
+            try: self._redraw_cell(self._images.index(r))
+            except ValueError: pass
+        self._highlight_rating_button(get_rating_from_name(rel))
+        self._update_tb_info(rel)
+
+    def _update_tb_info(self, rel):
+        """Update the info panel with details about rel."""
+        self._recolor_toolbar(rel)
+        if not hasattr(self, "_tb_info_idx"): return
+        rating = get_rating_from_name(rel)
+        try: idx = self._images.index(rel)
+        except ValueError: idx = -1
+        dirpart = os.path.dirname(rel)
+
+        self._tb_info_idx.config(text=f"{idx+1}/{len(self._images)}" if idx>=0 else "")
+        self._tb_info_star.config(text=f"★ {rating}/5" if rating is not None else "★ –/5")
+        # Update open comment dialog if any
+        if hasattr(self, "_comment_dlg") and self._comment_dlg:
+            try:
+                if self._comment_dlg.winfo_exists():
+                    self._comment_dlg.update_image(os.path.join(self.folder, rel))
+            except Exception: self._comment_dlg = None
+
+        if dirpart:
+            sub_imgs = [i for i,r in enumerate(self._images) if os.path.dirname(r)==dirpart]
+            sub_pos  = sub_imgs.index(idx)+1 if idx in sub_imgs else "?"
+            self._tb_info_sub.config(text=f"{sub_pos}/{len(sub_imgs)}")
+            short = dirpart if len(dirpart)<=12 else dirpart[:10]+"…"
+            self._tb_info_subname.config(text=short)
+        else:
+            self._tb_info_sub.config(text="")
+            self._tb_info_subname.config(text="")
+
+        # Resolution: try PIL cache first, else skip
+        pil = self._pil_cache.get(rel)
+        if pil:
+            self._tb_info_res.config(text=f"{pil.width}×{pil.height}")
+        else:
+            self._tb_info_res.config(text="")
+
+    # ── Recolor toolbar on selection ──────────────────────────────────────────
+
+    def _recolor_toolbar(self, rel):
+        """Update all registered toolbar background frames to the rating color.
+        Button boxes (#333xxx), info box (#222222), and the handle have fixed colors
+        and are never in _tb_bg_frames, so they are never touched here."""
+        rating    = get_rating_from_name(rel) if rel else None
+        bar_color = rating_color(rating) if rating is not None else BG_PANEL
+        dk        = _darken(bar_color, 0.7) if rating is not None else "#555555"
+        for frame in getattr(self, "_tb_bg_frames", []):
+            try: frame.config(bg=bar_color)
+            except Exception: pass
+        if hasattr(self, "_tb_container"):
+            try: self._tb_container.config(bg=bar_color)
+            except Exception: pass
+        if self._tb_handle:
+            try: self._tb_handle.config(bg=dk)
+            except Exception: pass
+
+    # ── Rating ────────────────────────────────────────────────────────────────
+
+    def _highlight_rating_button(self, active_rating):
+        for r, btn in self._rating_buttons.items():
+            base = rating_color(r)
+            if r == active_rating:
+                btn.config(bg=base, fg=_rating_fg(r), highlightthickness=0)
+            else:
+                btn.config(bg=_darken(base,0.5), fg=_rating_fg(r), highlightthickness=0)
+
+    def _rate_selected_all(self, rating):
+        for rel in list(self._selected):
+            self._rate_one(rel, rating)
+        self._highlight_rating_button(rating)
+        if self._last_sel:
+            self._update_tb_info(self._last_sel)
+
+    def _rate_one(self, old_rel, rating):
+        dirpart  = os.path.dirname(old_rel)
+        basename = os.path.basename(old_rel)
+        new_base = rating_prefix(rating) + strip_prefix(basename)
+        new_rel  = os.path.join(dirpart, new_base) if dirpart else new_base
+        old_path = os.path.join(self.folder, old_rel)
+        new_path = os.path.join(self.folder, new_rel)
+        if new_rel != old_rel:
+            try: os.rename(old_path, new_path)
+            except Exception as ex:
+                messagebox.showerror("Rename Error", str(ex)); return
+            idx = self._images.index(old_rel)
+            self._images[idx] = new_rel
+            if old_rel in self._pil_cache:
+                self._pil_cache[new_rel] = self._pil_cache.pop(old_rel)
+            for T in list({k[1] for k in self._ph_cache}):
+                if (old_rel,T) in self._ph_cache:
+                    self._ph_cache[(new_rel,T)] = self._ph_cache.pop((old_rel,T))
+            if old_rel in self._selected:
+                self._selected.discard(old_rel); self._selected.add(new_rel)
+            if self._last_sel == old_rel: self._last_sel = new_rel
+            # Notify parent viewer so its image list stays in sync
+            if self._rename_cb:
+                try: self._rename_cb(old_rel, new_rel)
+                except Exception: pass
+        else:
+            idx = self._images.index(old_rel)
+        self._redraw_cell(idx)
+
+    # ── Toolbar actions ───────────────────────────────────────────────────────
+
+    def _open_folder(self):
+        folder = filedialog.askdirectory(title="Select Folder", initialdir=self.folder)
+        if not folder: return
+        self.folder = folder
+        files = []
+        for root, dirs, fnames in os.walk(folder):
+            dirs.sort()
+            for f in sorted(fnames):
+                if f.lower().endswith(".png"):
+                    files.append(os.path.relpath(os.path.join(root,f), folder))
+        self._all_images = sort_files(files, folder, self._sort_method)
+        self._images     = list(self._all_images)
+        self._pil_cache.clear(); self._ph_cache.clear()
+        self._selected.clear(); self._last_sel = None; self._loading.clear()
+        self._full_refresh()
+
+    def _delete_trash(self):
+        trash = [r for r in self._images if get_rating_from_name(os.path.basename(r)) == 0]
+        if not trash:
+            messagebox.showinfo("Delete Trash","No rating-0 files found.",parent=self); return
+        if not messagebox.askyesno("Delete Trash",
+                f"Permanently delete {len(trash)} file(s) rated 0?",parent=self): return
+        for rel in trash:
+            try:
+                os.remove(os.path.join(self.folder, rel))
+                self._images.remove(rel)
+                self._pil_cache.pop(rel, None)
+                for T in list({k[1] for k in self._ph_cache}):
+                    self._ph_cache.pop((rel,T), None)
+                self._selected.discard(rel)
+            except Exception as ex:
+                messagebox.showerror("Delete Error", str(ex), parent=self)
+        self._full_refresh()
+
+    def _open_sort_dialog(self):
+        current = self._last_sel
+        def _tb_reload():
+            self._refresh()
+            if self._images:
+                first = self._images[0]
+                self._single_select(first)
+                self._scroll_to_image(first)
+        SortDialog(self, self.folder, self._settings, reload_cb=_tb_reload)
+
+    def _open_explorer_sel(self):
+        if self._last_sel:
+            open_in_explorer(os.path.join(self.folder, self._last_sel))
+        else:
+            open_in_explorer(self.folder)
+
+    def _pick_sort(self): OrderDialog(self, self._sort_method, self._apply_sort, self._settings)
+
+    def _apply_sort(self, method):
+        self._sort_method = method
+        self._images = sort_files(list(self._all_images), self.folder, method)
+        self._full_refresh()
+        self._settings["tb_sort"] = method; save_settings(self._settings)
+
+    def _toggle_tb_flat(self):
+        self._tb_flat = not self._tb_flat
+        self._full_refresh()
+
+    def _tb_subfolder_jump(self):
+        def _tb_jump_idx(idx):
+            if 0 <= idx < len(self._images):
+                rel = self._images[idx]
+                self._single_select(rel)
+                self._scroll_to_image(rel)
+        SubfolderDialog(self, self.folder, self._images, self._scroll_to_subdir,
+                        self._settings, jump_to_idx_cb=_tb_jump_idx)
+
+    def _show_comment(self):
+        if not self._last_sel:
+            messagebox.showinfo("No Selection","Select an image first.",parent=self); return
+        fpath = os.path.join(self.folder, self._last_sel)
+        if hasattr(self, "_comment_dlg") and self._comment_dlg and self._comment_dlg.winfo_exists():
+            self._comment_dlg.update_image(fpath)
+            self._comment_dlg.lift()
+        else:
+            self._comment_dlg = show_comment_dialog(
+                self, fpath, self._settings,
+                on_close=lambda: setattr(self, "_comment_dlg", None))
+
+    def _rename_unrated_popup(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("Unrated Prefix"); dlg.configure(bg=BG_DARK)
+        dlg.resizable(False, False); dlg.transient(self); dlg.grab_set()
+        tk.Label(dlg, text="Manage '-' prefix on unrated images:",
+                 bg=BG_DARK, fg=FG_INFO, font=("Segoe UI",10)).pack(padx=20, pady=(16,8))
+        def do_add():
+            count = 0
+            for i, rel in enumerate(self._images):
+                base = os.path.basename(rel)
+                if is_unrated(base):
+                    dirpart = os.path.dirname(rel)
+                    new_base = UNRATED_PREFIX + base
+                    new_rel  = os.path.join(dirpart, new_base) if dirpart else new_base
+                    try:
+                        os.rename(os.path.join(self.folder,rel),
+                                  os.path.join(self.folder,new_rel))
+                        self._images[i] = new_rel; count += 1
+                    except Exception: pass
+            dlg.destroy(); self._full_refresh()
+            messagebox.showinfo("Done", f"Added '-' prefix to {count} file(s).", parent=self)
+        def do_remove():
+            count = 0
+            for i, rel in enumerate(self._images):
+                base = os.path.basename(rel)
+                if has_unrated_prefix(base):
+                    dirpart  = os.path.dirname(rel)
+                    new_base = strip_prefix(base)
+                    new_rel  = os.path.join(dirpart, new_base) if dirpart else new_base
+                    try:
+                        os.rename(os.path.join(self.folder,rel),
+                                  os.path.join(self.folder,new_rel))
+                        self._images[i] = new_rel; count += 1
+                    except Exception: pass
+            dlg.destroy(); self._full_refresh()
+            messagebox.showinfo("Done", f"Removed '-' prefix from {count} file(s).", parent=self)
+        tk.Button(dlg, text="Add '-' to all truly unrated images",
+                  command=do_add, bg="#336633", fg=FG_WHITE,
+                  relief=tk.FLAT, font=("Segoe UI",10), pady=6, cursor="hand2").pack(
+                  padx=20, pady=4, fill=tk.X)
+        tk.Button(dlg, text="Remove '-' from all '-' prefixed images",
+                  command=do_remove, bg="#334466", fg=FG_WHITE,
+                  relief=tk.FLAT, font=("Segoe UI",10), pady=6, cursor="hand2").pack(
+                  padx=20, pady=4, fill=tk.X)
+        tk.Button(dlg, text="Cancel", command=dlg.destroy,
+                  bg=BG_BTN, fg=FG_DIM, relief=tk.FLAT,
+                  font=("Segoe UI",9), pady=4).pack(pady=(4,16))
+
+    def _move_files(self):
+        def done():
+            self.after(100, self._open_folder)
+        MoveFilesDialog(self, self.folder, self._settings, done)
+
+    def _open_settings(self):
+        SettingsDialog(self, self._settings)
+
+    def _refresh(self):
+        files = []
+        for root, dirs, fnames in os.walk(self.folder):
+            dirs.sort()
+            for f in sorted(fnames):
+                if f.lower().endswith(".png"):
+                    files.append(os.path.relpath(os.path.join(root,f), self.folder))
+        self._all_images = sort_files(files, self.folder, self._sort_method)
+        self._images     = list(self._all_images)
+        self._pil_cache.clear(); self._ph_cache.clear()
+        self._selected.clear(); self._last_sel = None; self._loading.clear()
+        self._full_refresh()
+
+
+
+
+# ── Settings Dialog ───────────────────────────────────────────────────────────
+
+class SettingsDialog(tk.Toplevel):
+    """Comprehensive settings dialog for Image Rater."""
+
+    # Hotkey definitions moved to module-level HOTKEY_DEFAULTS
+
+    def __init__(self, parent, settings):
+        super().__init__(parent)
+        self.title("Settings")
+        self.configure(bg=BG_DARK)
+        self.resizable(True, True)
+        self.transient(parent)
+        self.grab_set()
+        self._settings = settings
+        restore_popup_geom(self, settings, "settings_dlg", "640x700")
+        bind_popup_geom(self, settings, "settings_dlg")
+        self._build_ui()
+
+    def _build_ui(self):
+        # Notebook-style tabs via frame switcher
+        top = tk.Frame(self, bg=BG_PANEL, pady=4); top.pack(fill=tk.X)
+        self._tabs     = {}
+        self._tab_btns = {}
+        self._active   = tk.StringVar(value="General")
+        content = tk.Frame(self, bg=BG_DARK); content.pack(fill=tk.BOTH, expand=True)
+
+        tab_names = ["General", "Hotkeys", "Appearance", "Folders"]
+        for name in tab_names:
+            frame = tk.Frame(content, bg=BG_DARK); self._tabs[name] = frame
+            btn = tk.Button(top, text=name, command=lambda n=name: self._switch(n),
+                            bg=BG_BTN, fg=FG_WHITE, relief=tk.FLAT,
+                            font=("Segoe UI",9), padx=12, pady=4, cursor="hand2")
+            btn.pack(side=tk.LEFT, padx=2)
+            self._tab_btns[name] = btn
+
+        self._build_general(self._tabs["General"])
+        self._build_hotkeys(self._tabs["Hotkeys"])
+        self._build_appearance(self._tabs["Appearance"])
+        self._build_folders(self._tabs["Folders"])
+        self._switch("General")
+
+        bot = tk.Frame(self, bg=BG_PANEL, pady=6); bot.pack(fill=tk.X, side=tk.BOTTOM)
+        tk.Button(bot, text="Save & Close", command=self._save_close,
+                  bg="#336633", fg=FG_WHITE, relief=tk.FLAT, font=("Segoe UI",10,"bold"),
+                  padx=16, pady=6, cursor="hand2").pack(side=tk.RIGHT, padx=10)
+        tk.Button(bot, text="Cancel", command=self.destroy,
+                  bg=BG_BTN, fg=FG_DIM, relief=tk.FLAT, font=("Segoe UI",9),
+                  padx=12, pady=6, cursor="hand2").pack(side=tk.RIGHT, padx=4)
+        self._status = tk.Label(bot, text="", bg=BG_PANEL, fg=FG_RATING, font=("Segoe UI",8))
+        self._status.pack(side=tk.LEFT, padx=10)
+
+    def _switch(self, name):
+        for n, f in self._tabs.items(): f.pack_forget()
+        self._tabs[name].pack(fill=tk.BOTH, expand=True)
+        for n, b in self._tab_btns.items():
+            b.config(bg="#406080" if n == name else BG_BTN)
+        self._active.set(name)
+
+    # ── General tab ──────────────────────────────────────────────────────────
+    def _build_general(self, frame):
+        def section(text):
+            tk.Label(frame, text=text, bg=BG_DARK, fg=FG_RATING,
+                     font=("Segoe UI",9,"bold")).pack(anchor=tk.W, padx=16, pady=(12,2))
+            tk.Frame(frame, bg="#555", height=1).pack(fill=tk.X, padx=16, pady=(0,6))
+
+        def toggle_row(label, key, default=True):
+            row = tk.Frame(frame, bg=BG_DARK); row.pack(fill=tk.X, padx=16, pady=2)
+            var = tk.BooleanVar(value=self._settings.get(key, default))
+            cb = tk.Checkbutton(row, text=label, variable=var, bg=BG_DARK, fg=FG_INFO,
+                                selectcolor="#333", activebackground=BG_DARK,
+                                activeforeground=FG_WHITE, font=("Segoe UI",9),
+                                cursor="hand2")
+            cb.pack(side=tk.LEFT)
+            return var
+
+        def entry_row(label, key, default="", width=30):
+            row = tk.Frame(frame, bg=BG_DARK); row.pack(fill=tk.X, padx=16, pady=2)
+            tk.Label(row, text=label, bg=BG_DARK, fg=FG_INFO,
+                     font=("Segoe UI",9), width=28, anchor=tk.W).pack(side=tk.LEFT)
+            var = tk.StringVar(value=str(self._settings.get(key, default)))
+            tk.Entry(row, textvariable=var, bg="#333", fg=FG_WHITE, width=width,
+                     insertbackground=FG_WHITE, relief=tk.FLAT, font=("Segoe UI",9)
+                     ).pack(side=tk.LEFT, padx=4)
+            return var
+
+        section("Navigation")
+        self._v_auto_prefix   = toggle_row("Auto-prefix unrated images with '-' when first viewed",
+                                            "auto_prefix", True)
+        self._v_wrap_nav      = toggle_row("Wrap around at end/start of folder", "wrap_nav", True)
+        self._v_auto_open     = toggle_row("Auto-open folder picker on launch", "auto_open", True)
+
+        section("Thumbnail Browser")
+        self._v_tb_flat       = toggle_row("Default to flat mode (ignore subfolders)", "tb_flat", False)
+        self._v_tb_bar_left   = toggle_row("Default toolbar position: left side", "tb_bar_left", False)
+
+        section("Display")
+        self._v_fit_on_load   = toggle_row("Fit image to window on load", "fit_on_load", True)
+        self._v_remember_zoom = toggle_row("Remember zoom level per image", "remember_zoom", False)
+
+    # ── Hotkeys tab ──────────────────────────────────────────────────────────
+    def _build_hotkeys(self, frame):
+        """Fully editable hotkey bindings. Click a button, press the new key."""
+        self._hk_vars    = {}   # key -> StringVar holding tk sequence
+        self._hk_btn     = {}   # key -> Button widget
+        self._hk_listen  = None # key currently listening for a keypress
+
+        # Instructions
+        instr = tk.Frame(frame, bg="#1a2a1a", padx=8, pady=6)
+        instr.pack(fill=tk.X, padx=8, pady=(8,4))
+        tk.Label(instr, text="Click any hotkey button, then press the desired key. "
+                              "Modifiers: hold Ctrl/Alt/Shift before pressing.",
+                 bg="#1a2a1a", fg="#88cc88", font=("Segoe UI",8),
+                 wraplength=550, justify=tk.LEFT).pack(anchor=tk.W)
+
+        # Scrollable list
+        sf = tk.Frame(frame, bg=BG_DARK); sf.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0,4))
+        vsb = tk.Scrollbar(sf, orient=tk.VERTICAL, bg=BG_PANEL, troughcolor=BG_DARK)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas = tk.Canvas(sf, bg=BG_DARK, highlightthickness=0, yscrollcommand=vsb.set)
+        canvas.pack(fill=tk.BOTH, expand=True)
+        vsb.config(command=canvas.yview)
+        inner = tk.Frame(canvas, bg=BG_DARK)
+        canvas.create_window((0,0), window=inner, anchor=tk.NW)
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(-1*(e.delta//120),"units"))
+
+        # Header
+        hdr = tk.Frame(inner, bg="#333333"); hdr.pack(fill=tk.X, pady=(0,2))
+        for txt, w in (("Description", 30), ("Current hotkey", 16), ("", 8)):
+            tk.Label(hdr, text=txt, bg="#333333", fg=FG_RATING,
+                     font=("Segoe UI",8,"bold"), width=w, anchor=tk.W
+                     ).pack(side=tk.LEFT, padx=6, pady=4)
+
+        # Rebindable rows
+        for i, (hk_key, (desc, default, _)) in enumerate(HOTKEY_DEFAULTS.items()):
+            row_bg = BG_DARK if i % 2 == 0 else "#252525"
+            row = tk.Frame(inner, bg=row_bg); row.pack(fill=tk.X, pady=1)
+
+            var = tk.StringVar(value=self._settings.get(hk_key, default))
+            self._hk_vars[hk_key] = var
+
+            tk.Label(row, text=desc, bg=row_bg, fg=FG_INFO, font=("Segoe UI",8),
+                     width=30, anchor=tk.W).pack(side=tk.LEFT, padx=6, pady=3)
+
+            btn = tk.Button(row, textvariable=None,  # we set text manually
+                            text=hk_display(var.get()),
+                            bg="#2a3a4a", fg="#88bbff",
+                            relief=tk.FLAT, font=("Segoe UI",8,"bold"),
+                            width=16, cursor="hand2",
+                            command=lambda k=hk_key: self._hk_start_listen(k))
+            btn.pack(side=tk.LEFT, padx=4)
+            self._hk_btn[hk_key] = btn
+
+            # Track var changes to update btn text
+            def _update_btn(k=hk_key, v=var, b=btn):
+                b.config(text=hk_display(v.get()))
+            var.trace_add("write", lambda *a, k=hk_key, v=var, b=btn:
+                          b.config(text=hk_display(v.get())))
+
+            tip(tk.Button(row, text="↺", command=lambda k=hk_key, d=default: self._hk_reset(k,d),
+                      bg="#333333", fg=FG_DIM, relief=tk.FLAT, font=("Segoe UI",8),
+                      cursor="hand2", padx=4, pady=1),
+                "Reset to default").pack(side=tk.LEFT, padx=2)
+
+        # Fixed (non-rebindable) rows
+        sep_row = tk.Frame(inner, bg="#444444", height=1)
+        sep_row.pack(fill=tk.X, pady=(8,2))
+        tk.Label(inner, text="Fixed bindings (not rebindable):",
+                 bg=BG_DARK, fg=FG_DIM, font=("Segoe UI",7,"italic")).pack(anchor=tk.W, padx=6)
+        for j, (hotkey, fdesc) in enumerate(HOTKEY_FIXED):
+            row_bg = BG_DARK if j % 2 == 0 else "#252525"
+            row = tk.Frame(inner, bg=row_bg); row.pack(fill=tk.X, pady=1)
+            tk.Label(row, text=fdesc, bg=row_bg, fg=FG_DIM, font=("Segoe UI",8),
+                     width=30, anchor=tk.W).pack(side=tk.LEFT, padx=6, pady=2)
+            tk.Label(row, text=hotkey, bg=row_bg, fg="#888888", font=("Segoe UI",8),
+                     width=16, anchor=tk.W).pack(side=tk.LEFT, padx=4)
+
+        # Bind key capture to THIS dialog
+        self.bind("<KeyPress>", self._hk_capture)
+
+    def _hk_start_listen(self, key):
+        """Enter listening mode for the given action key."""
+        # Cancel any previous listen
+        if self._hk_listen and self._hk_listen in self._hk_btn:
+            old = self._hk_listen
+            self._hk_btn[old].config(bg="#2a3a4a", fg="#88bbff",
+                                      text=hk_display(self._hk_vars[old].get()))
+        self._hk_listen = key
+        self._hk_btn[key].config(bg="#553300", fg="#ffcc44", text="Press key…")
+        self.focus_set()
+
+    def _hk_capture(self, event):
+        """Capture a keypress and assign it to the listening action."""
+        if not self._hk_listen: return
+        # Ignore pure modifier presses
+        if event.keysym in ("Control_L","Control_R","Alt_L","Alt_R",
+                             "Shift_L","Shift_R","Super_L","Super_R",
+                             "Caps_Lock","Num_Lock","Scroll_Lock"): return
+        # Build tk sequence
+        mods = ""
+        if event.state & 0x4:  mods += "Control-"
+        if event.state & 0x8:  mods += "Alt-"
+        if event.state & 0x1:  mods += "Shift-"
+        sym = event.keysym
+        # For plain printable single chars, store without angle brackets
+        if len(sym) == 1 and not mods:
+            seq = sym
+        else:
+            seq = f"<{mods}{sym}>"
+        key = self._hk_listen
+        self._hk_vars[key].set(seq)
+        self._hk_btn[key].config(bg="#2a3a4a", fg="#88bbff", text=hk_display(seq))
+        self._hk_listen = None
+
+    def _hk_reset(self, key, default):
+        """Reset a hotkey to its default."""
+        self._hk_vars[key].set(default)
+        if key in self._hk_btn:
+            self._hk_btn[key].config(bg="#2a3a4a", fg="#88bbff",
+                                      text=hk_display(default))
+        if self._hk_listen == key:
+            self._hk_listen = None
+
+    # ── Appearance tab ────────────────────────────────────────────────────────
+    def _build_appearance(self, frame):
+        def section(text):
+            tk.Label(frame, text=text, bg=BG_DARK, fg=FG_RATING,
+                     font=("Segoe UI",9,"bold")).pack(anchor=tk.W, padx=16, pady=(12,2))
+            tk.Frame(frame, bg="#555", height=1).pack(fill=tk.X, padx=16, pady=(0,6))
+
+        def spin_row(label, key, default, lo, hi):
+            row = tk.Frame(frame, bg=BG_DARK); row.pack(fill=tk.X, padx=16, pady=2)
+            tk.Label(row, text=label, bg=BG_DARK, fg=FG_INFO, font=("Segoe UI",9),
+                     width=32, anchor=tk.W).pack(side=tk.LEFT)
+            var = tk.StringVar(value=str(self._settings.get(key, default)))
+            sb = tk.Spinbox(row, textvariable=var, from_=lo, to=hi, width=6,
+                            bg="#333", fg=FG_WHITE, insertbackground=FG_WHITE,
+                            buttonbackground=BG_BTN, relief=tk.FLAT, font=("Segoe UI",9))
+            sb.pack(side=tk.LEFT, padx=4)
+            return var
+
+        section("Viewer Toolbar")
+        self._v_lbar_width    = spin_row("Left toolbar width (px)",    "lbar_width",   82,  60, 200)
+        self._v_rbar_h_def    = spin_row("Bottom rating bar default height (px)", "rbar_h_default", 29, 18, 120)
+
+        section("Thumbnail Browser")
+        self._v_tb_size_def   = spin_row("Default thumbnail size (px)", "tb_thumb_size", 140, 60, 900)
+        self._v_tb_bar_h      = spin_row("Toolbar height when horizontal (px)", "tb_bar_h",  50, 30, 200)
+
+        section("Thumbnail Cell")
+        self._v_tb_label_h    = spin_row("Label height below thumbnail (px)", "tb_label_h_user", 14, 8, 30)
+        self._v_tb_border     = spin_row("Thumbnail border thickness (px)",    "tb_border_user",  3, 0, 10)
+        self._v_tb_pad        = spin_row("Thumbnail padding (px)",             "tb_pad_user",     2, 0, 12)
+
+    # ── Folders tab ───────────────────────────────────────────────────────────
+    def _build_folders(self, frame):
+        def section(text):
+            tk.Label(frame, text=text, bg=BG_DARK, fg=FG_RATING,
+                     font=("Segoe UI",9,"bold")).pack(anchor=tk.W, padx=16, pady=(12,2))
+            tk.Frame(frame, bg="#555", height=1).pack(fill=tk.X, padx=16, pady=(0,6))
+
+        def folder_row(label, key, default=""):
+            row = tk.Frame(frame, bg=BG_DARK); row.pack(fill=tk.X, padx=16, pady=3)
+            tk.Label(row, text=label, bg=BG_DARK, fg=FG_INFO, font=("Segoe UI",9),
+                     anchor=tk.W).pack(fill=tk.X, pady=(0,2))
+            row2 = tk.Frame(frame, bg=BG_DARK); row2.pack(fill=tk.X, padx=16, pady=(0,4))
+            var = tk.StringVar(value=str(self._settings.get(key, default)))
+            e = tk.Entry(row2, textvariable=var, bg="#333", fg=FG_WHITE, width=46,
+                         insertbackground=FG_WHITE, relief=tk.FLAT, font=("Segoe UI",9))
+            e.pack(side=tk.LEFT, padx=(0,4))
+            def browse():
+                d = filedialog.askdirectory(initialdir=var.get() or os.path.expanduser("~"))
+                if d: var.set(d)
+            tk.Button(row2, text="Browse…", command=browse, bg=BG_BTN, fg=FG_WHITE,
+                      relief=tk.FLAT, font=("Segoe UI",9), padx=8, pady=2,
+                      cursor="hand2").pack(side=tk.LEFT)
+            return var
+
+        section("Default Paths")
+        self._v_default_folder  = folder_row("Default folder (opened at launch / when no folder set):",
+                                              "default_folder", DEFAULT_FOLDER)
+        self._v_move_dest       = folder_row("Default 'Move files' destination:",
+                                              "move_dest_folder",
+                                              self._settings.get("move_dest_folder", DEFAULT_FOLDER))
+
+        section("Sort")
+        row = tk.Frame(frame, bg=BG_DARK); row.pack(fill=tk.X, padx=16, pady=4)
+        tk.Label(row, text="Default sort order:", bg=BG_DARK, fg=FG_INFO,
+                 font=("Segoe UI",9), width=22, anchor=tk.W).pack(side=tk.LEFT)
+        self._v_sort = tk.StringVar(value=self._settings.get("sort_method", "Name"))
+        om = tk.OptionMenu(row, self._v_sort, *SORT_OPTIONS)
+        om.config(bg="#333", fg=FG_WHITE, relief=tk.FLAT, font=("Segoe UI",9),
+                  activebackground="#444", highlightthickness=0)
+        om["menu"].config(bg="#333", fg=FG_WHITE, font=("Segoe UI",9))
+        om.pack(side=tk.LEFT, padx=4)
+
+    # ── Save ──────────────────────────────────────────────────────────────────
+    def _save_close(self):
+        s = self._settings
+        # General
+        s["auto_prefix"]   = self._v_auto_prefix.get()
+        s["wrap_nav"]       = self._v_wrap_nav.get()
+        s["auto_open"]      = self._v_auto_open.get()
+        s["tb_flat"]        = self._v_tb_flat.get()
+        s["tb_bar_left"]    = self._v_tb_bar_left.get()
+        s["fit_on_load"]    = self._v_fit_on_load.get()
+        s["remember_zoom"]  = self._v_remember_zoom.get()
+        # Appearance
+        for key, var in (
+            ("lbar_width",      self._v_lbar_width),
+            ("rbar_h_default",  self._v_rbar_h_def),
+            ("tb_thumb_size",   self._v_tb_size_def),
+            ("tb_bar_h",        self._v_tb_bar_h),
+            ("tb_label_h_user", self._v_tb_label_h),
+            ("tb_border_user",  self._v_tb_border),
+            ("tb_pad_user",     self._v_tb_pad),
+        ):
+            try: s[key] = int(var.get())
+            except ValueError: pass
+        # Hotkeys
+        for hk_key, var in self._hk_vars.items():
+            s[hk_key] = var.get()
+        # Folders
+        s["default_folder"]  = self._v_default_folder.get()
+        s["move_dest_folder"] = self._v_move_dest.get()
+        s["sort_method"]      = self._v_sort.get()
+        save_settings(s)
+        self._status.config(text="Saved! Hotkeys take effect on next launch.")
+        self.after(1200, self.destroy)
+
+# ── Main Application ──────────────────────────────────────────────────────────
+
+class ImageRater(tk.Tk):
+    RBAR_BOTTOM  = 0
+    RBAR_HIDDEN  = 1
+    RBAR_SIDEBAR = 2
+
+    def __init__(self):
+        super().__init__()
+        self.configure(bg=BG_DARK)
+        self._settings = load_settings()
+        self.geometry(self._settings.get("main_geometry", "1000x700"))
+
+        self.folder          = None
+        self.images          = []
+        self.index           = 0
+        self._photo          = None
+        self._zoom           = 1.0
+        self._fit            = True
+        self._auto_prefix    = self._settings.get("auto_prefix", True)
+        self._rbar_state     = self._settings.get("rbar_state", self.RBAR_BOTTOM)
+        self._rbar_h         = RBAR_H_DEFAULT
+        self._grab_y         = None
+        self._rating_buttons = {}
+        self._nav_buttons    = {}
+        self._sort_method    = self._settings.get("sort_method", "Name")
+        self._flat_mode      = False
+        self._thumb_browser  = None
+        self._sidebar_btns   = {}
+        self._geom_save_job  = None
+
+        self._build_ui()
+        self._bind_keys()
+        self._update_title()
+        self.after(500, lambda: self.bind("<Configure>", self._on_main_configure))
+        # Auto-open folder picker on launch
+        self.after(150, self._auto_open_on_start)
+
+    def _auto_open_on_start(self):
+        self.open_folder()
+
+    def _on_main_configure(self, e=None):
+        if self._geom_save_job: self.after_cancel(self._geom_save_job)
+        self._geom_save_job = self.after(600, self._save_main_geom)
+
+    def _save_main_geom(self):
+        try:
+            self._settings["main_geometry"] = self.geometry()
+            save_settings(self._settings)
+        except Exception: pass
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        self._left_toolbar = tk.Frame(self, bg=BG_PANEL, padx=4, pady=8, width=82)
+        self._left_toolbar.pack(side=tk.LEFT, fill=tk.Y)
+        self._left_toolbar.pack_propagate(False)
+        self._right_area = tk.Frame(self, bg=BG_DARK)
+        self._right_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._build_left_toolbar()
+        self._build_right_area()
+
+    def _build_left_toolbar(self):
+        tb = self._left_toolbar
+        for w in tb.winfo_children(): w.destroy()
+        BOX  = "#333333"   # dark outer box
+        BTN  = "#484848"   # slightly lighter button fill
+        BPAD = 3
+
+        def tb_btn(text, cmd, btn_bg=BTN, box_bg=BOX, tooltip=""):
+            """Button in a dark grey box; colors never change with toolbar recolor."""
+            outer = tk.Frame(tb, bg=box_bg, padx=BPAD, pady=BPAD)
+            outer.pack(pady=2, padx=4, fill=tk.X)
+            b = tk.Button(outer, text=text, command=cmd, bg=btn_bg, fg=FG_WHITE,
+                          relief=tk.FLAT, font=("Segoe UI",9),
+                          pady=4, cursor="hand2")
+            b.pack(fill=tk.X)
+            if tooltip: tip(b, tooltip)
+            return b
+
+        def sep():
+            tk.Frame(tb, bg="#555", height=1).pack(fill=tk.X, pady=3)
+
+        tb_btn("📂", self.open_folder, tooltip="Open folder (file picker)")
+        tb_btn("🗂", self._open_explorer, tooltip="Open current file in Windows Explorer")
+        tb_btn("→📁", self._move_files, tooltip="Move all files to another folder")
+        sep()
+        self.fit_btn = tb_btn("Fit", self.toggle_fit, tooltip="Toggle fit-to-window / native zoom")
+        tb_btn("🔍+", lambda: self.zoom(1.2), tooltip="Zoom in")
+        tb_btn("🔍-", lambda: self.zoom(1/1.2), tooltip="Zoom out")
+        sep()
+        tb_btn("⊞",   self.open_thumb_browser, tooltip="Open thumbnail browser")
+        tb_btn("🗑",   self._delete_trash, btn_bg="#662222", box_bg="#441111",
+               tooltip="Delete all rating-0 (trash) files")
+        tb_btn("⚙",   self._open_sort_dialog, btn_bg="#444466", box_bg="#2a2a44",
+               tooltip="Sort files by keyword into subfolders")
+        tb_btn("📂⚙", self._open_subfolder_dialog, tooltip="Jump to a subfolder")
+        tb_btn("📝",   self._show_comment, tooltip="Show PNG comment metadata")
+        sep()
+        self._auto_btn = tb_btn("A:-", self._toggle_auto_prefix,
+                                 btn_bg="#336633", box_bg="#224422",
+                                 tooltip="Toggle auto-prefix unseen images with '-'")
+        tb_btn("=-0", self._rate_unrated_as_trash, btn_bg="#663333", box_bg="#441111",
+               tooltip="Rate all '-' files as 0 (trash)")
+        tb_btn("↕",   self._pick_sort, tooltip="Change sort order")
+        self._flat_btn_outer = tk.Frame(tb, bg=BOX, padx=BPAD, pady=BPAD)
+        self._flat_btn_outer.pack(pady=2, padx=4, fill=tk.X)
+        self._flat_btn = tk.Button(self._flat_btn_outer, text="⊟", command=self._toggle_flat,
+                                    bg=BTN, fg=FG_WHITE, relief=tk.FLAT,
+                                    font=("Segoe UI",9), pady=4, cursor="hand2")
+        self._flat_btn.pack(fill=tk.X)
+        tip(self._flat_btn, "Toggle flat mode (ignore subfolders in ordering)")
+        self._update_flat_btn()
+        sep()
+        tb_btn("⚙S", self._open_settings, tooltip="Open settings")
+
+        # Info box — one unified dark grey box; toolbar width controls the space,
+        # no wraplength clipping. Labels use full available width.
+        info_box = tk.Frame(tb, bg="#222222", padx=4, pady=6)
+        info_box.pack(pady=(6,0), padx=2, fill=tk.X)
+        def _ilabel(text="", fg=FG_RATING, font=("Segoe UI",9,"bold")):
+            lbl = tk.Label(info_box, text=text, bg="#222222", fg=fg, font=font,
+                           anchor=tk.CENTER, justify=tk.CENTER)
+            lbl.pack(fill=tk.X, pady=1)
+            return lbl
+        self.index_label        = _ilabel(fg=FG_RATING, font=("Segoe UI",9,"bold"))
+        self.subdir_index_label = _ilabel(fg=FG_RATING, font=("Segoe UI",7))
+        self.subdir_name_label  = _ilabel(fg=FG_RATING, font=("Segoe UI",7))
+        self.res_label          = _ilabel(fg="#aaaaaa",  font=("Segoe UI",7))
+        self.star_label         = _ilabel(fg=FG_RATING, font=("Segoe UI",10,"bold"))
+
+        self._lt_spacer = tk.Frame(tb, bg=BG_PANEL); self._lt_spacer.pack(fill=tk.Y, expand=True)
+
+        bar_toggle_outer = tk.Frame(tb, bg="#333333", padx=3, pady=3)
+        bar_toggle_outer.pack(pady=(0,6), padx=4, fill=tk.X)
+        self._bar_toggle_btn = tk.Button(bar_toggle_outer, text="▬", command=self._cycle_rbar,
+                                          bg="#484848", fg=FG_WHITE, relief=tk.FLAT,
+                                          font=("Segoe UI",9), pady=4, cursor="hand2")
+        self._bar_toggle_btn.pack(fill=tk.X)
+        tip(self._bar_toggle_btn, "Cycle rating toolbar: bottom → hidden → sidebar")
+
+    def _build_right_area(self):
+        ra = self._right_area
+        self._rbar_sidebar_frame = tk.Frame(ra, bg=BG_PANEL, width=54)
+        self._img_area = tk.Frame(ra, bg=BG_DARK)
+        self._img_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.canvas = tk.Canvas(self._img_area, bg=BG_DARK, highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.canvas.bind("<Configure>", lambda e: self._redisplay())
+        # canvas wheel handled at root level only
+
+        self._rbar_outer = tk.Frame(self._img_area, bg=BG_PANEL)
+        self._rbar_outer.pack(fill=tk.X, side=tk.BOTTOM)
+        self._handle = tk.Frame(self._rbar_outer, bg="#555555", height=6,
+                                 cursor="sb_v_double_arrow")
+        self._handle.pack(fill=tk.X, side=tk.TOP)
+        self._handle.bind("<ButtonPress-1>",   self._grab_start)
+        self._handle.bind("<B1-Motion>",        self._grab_drag)
+        self._handle.bind("<ButtonRelease-1>", self._grab_end)
+        self._rbar = tk.Frame(self._rbar_outer, bg=BG_PANEL)
+        self._rbar.pack(fill=tk.BOTH, expand=True)
+
+        self._build_rating_bar()
+        self._apply_rbar_state()
+
+    def _build_rating_bar(self):
+        for w in self._rbar.winfo_children(): w.destroy()
+        self._rating_buttons.clear(); self._nav_buttons.clear()
+        rating    = get_rating_from_name(self.images[self.index]) if self.images else None
+        bar_color = rating_color(rating) if rating is not None else BG_PANEL
+        self._rbar_outer.config(bg=bar_color)
+        self._rbar.config(bg=bar_color)
+        self._handle.config(bg=_darken(bar_color,0.7) if rating is not None else "#555555")
+        h     = self._rbar_h
+        btn_h = max(16, h-8)
+        btn_w = max(22, int(btn_h*1.15))
+        fs    = max(7, min(16, btn_h//3))
+        row   = tk.Frame(self._rbar, bg=bar_color)
+        row.pack(expand=True, anchor=tk.CENTER, pady=2)
+        def make_btn(text, cmd, color, fg=FG_WHITE, tt=""):
+            cell = tk.Frame(row, bg=bar_color, width=btn_w+6, height=btn_h+4)
+            cell.pack_propagate(False); cell.pack(side=tk.LEFT, padx=2)
+            b = tk.Button(cell, text=text, command=cmd, bg=color, fg=fg,
+                          relief=tk.FLAT, font=("Segoe UI",fs,"bold"), cursor="hand2")
+            b.place(relx=0.5, rely=0.5, anchor=tk.CENTER, width=btn_w, height=btn_h)
+            if tt: tip(b, tt)
+            return b
+        self._nav_buttons['prev'] = make_btn("◀", self.prev_image, BG_BTN, tt="Previous image")
+        cur_r = get_rating_from_name(self.images[self.index]) if self.images else 0
+        max_r = max(5, (cur_r or 0) + 1)
+        for i in range(max_r + 1):
+            self._rating_buttons[i] = make_btn(str(i), lambda r=i: self.rate_image(r),
+                                                rating_color(i), _rating_fg(i), tt=f"Rate as {i}")
+        self._nav_buttons['next'] = make_btn("▶", self.next_image, BG_BTN, tt="Next image")
+        if self.images:
+            self._highlight_rating_button(get_rating_from_name(self.images[self.index]))
+
+    def _build_rating_sidebar(self):
+        sf = self._rbar_sidebar_frame
+        for w in sf.winfo_children(): w.destroy()
+        self._sidebar_btns.clear()
+        rating    = get_rating_from_name(self.images[self.index]) if self.images else None
+        bar_color = rating_color(rating) if rating is not None else BG_PANEL
+        # Fix width to prevent resize on recolor
+        sf.config(bg=bar_color, width=54)
+        sf.pack_propagate(False)
+        tk.Button(sf, text="▲", command=self.prev_image, bg=BG_BTN, fg=FG_WHITE,
+                  relief=tk.FLAT, font=("Segoe UI",9,"bold"), cursor="hand2",
+                  width=4, pady=4).pack(pady=(4,2), padx=2)
+        cur_r2 = get_rating_from_name(self.images[self.index]) if self.images else 0
+        max_r2 = max(5, (cur_r2 or 0) + 1)
+        for i in list(range(max_r2, -1, -1)):
+            b = tk.Button(sf, text=str(i), bg=rating_color(i), fg=_rating_fg(i),
+                          relief=tk.FLAT, font=("Segoe UI",11,"bold"), cursor="hand2",
+                          width=4, pady=6, command=lambda r=i: self.rate_image(r))
+            b.pack(pady=2, padx=2)
+            tip(b, f"Rate as {i}")
+            self._sidebar_btns[i] = b
+        tk.Button(sf, text="▼", command=self.next_image, bg=BG_BTN, fg=FG_WHITE,
+                  relief=tk.FLAT, font=("Segoe UI",9,"bold"), cursor="hand2",
+                  width=4, pady=4).pack(pady=(2,4), padx=2)
+        if self.images:
+            self._highlight_rating_button(rating)
+
+    def _apply_rbar_state(self):
+        state = self._rbar_state
+        if state == self.RBAR_BOTTOM:
+            self._rbar_outer.pack(fill=tk.X, side=tk.BOTTOM)
+        else:
+            self._rbar_outer.pack_forget()
+        if state == self.RBAR_SIDEBAR:
+            self._rbar_sidebar_frame.pack(side=tk.LEFT, fill=tk.Y, before=self._img_area)
+            self._build_rating_sidebar()
+        else:
+            self._rbar_sidebar_frame.pack_forget()
+        icons = ["▬","▬✗","◧"]
+        self._bar_toggle_btn.config(text=icons[state])
+
+    def _cycle_rbar(self):
+        self._rbar_state = (self._rbar_state+1) % 3
+        self._settings["rbar_state"] = self._rbar_state
+        save_settings(self._settings)
+        self._apply_rbar_state()
+
+    # ── Grab handle ──────────────────────────────────────────────────────────
+
+    def _grab_start(self, e): self._grab_y = e.y_root
+    def _grab_end(self, e):   self._grab_y = None
+
+    def _grab_drag(self, e):
+        if self._grab_y is None: return
+        dy = self._grab_y - e.y_root; self._grab_y = e.y_root
+        new_h = max(RBAR_H_MIN, min(RBAR_H_MAX, self._rbar_h + dy))
+        if new_h != self._rbar_h:
+            self._rbar_h = new_h; self._build_rating_bar()
+
+    # ── Toggles ──────────────────────────────────────────────────────────────
+
+    def _toggle_auto_prefix(self):
+        self._auto_prefix = not self._auto_prefix
+        self._auto_btn.config(bg="#336633" if self._auto_prefix else "#663333",
+                               text="A:-" if self._auto_prefix else "A:✗")
+
+    def _toggle_flat(self):
+        self._flat_mode = not self._flat_mode
+        self._update_flat_btn()
+        if self.folder:
+            current_rel = self.images[self.index] if self.images else None
+            self.load_folder(start_index=0)
+            if current_rel and current_rel in self.images:
+                self.index = self.images.index(current_rel)
+                self.show_image()
+
+    def _update_flat_btn(self):
+        BTN = "#484848"
+        self._flat_btn.config(bg="#336633" if self._flat_mode else BTN,
+                               text="⊟" if self._flat_mode else "⊞✦")
+        try:
+            self._flat_btn_outer.config(bg="#224422" if self._flat_mode else "#333333")
+        except Exception: pass
+
+    # ── Key bindings ─────────────────────────────────────────────────────────
+
+    def _bind_keys(self):
+        s = self._settings
+        def hk(key): return get_hk(s, key)
+
+        # Navigation
+        for seq in (hk("hk_prev"), hk("hk_prev2")):
+            try: self.bind(seq, lambda e: self.prev_image())
+            except Exception: pass
+        for seq in (hk("hk_next"), hk("hk_next2")):
+            try: self.bind(seq, lambda e: self.next_image())
+            except Exception: pass
+        # Rating
+        for seq in (hk("hk_rate_0"), hk("hk_rate_0b")):
+            try: self.bind(seq, lambda e: self.rate_image(0))
+            except Exception: pass
+        for r_key, r_num in (("hk_rate_1",1),("hk_rate_2",2),("hk_rate_3",3),
+                              ("hk_rate_4",4),("hk_rate_5",5)):
+            try: self.bind(hk(r_key), lambda e,r=r_num: self.rate_image(r))
+            except Exception: pass
+        # Zoom / fit
+        for seq in (hk("hk_zoom_in"), "<plus>"):
+            try: self.bind(seq, lambda e: self.zoom(1.2))
+            except Exception: pass
+        try: self.bind(hk("hk_zoom_out"), lambda e: self.zoom(1/1.2))
+        except Exception: pass
+        try: self.bind(hk("hk_fit"), lambda e: self.toggle_fit())
+        except Exception: pass
+        # Mouse extras (fixed)
+        for btn_num in (4,5,6,7,8,9):
+            try:
+                self.bind(f"<Button-{btn_num}>",
+                          lambda e,n=btn_num: self._any_extra_button(e,n))
+            except Exception: pass
+        for virt,cb in (("<XButton1>",self._mouse5),("<XButton2>",self._mouse4)):
+            try: self.bind(virt, cb)
+            except Exception: pass
+        try:
+            self.event_add("<<Mouse4>>","<Button-8>"); self.event_add("<<Mouse5>>","<Button-9>")
+            self.bind("<<Mouse4>>",self._mouse5); self.bind("<<Mouse5>>",self._mouse4)
+        except Exception: pass
+
+    def _any_extra_button(self, e, num):
+        if num in (4,8): self._mouse5(e)
+        elif num in (5,9): self._mouse4(e)
+
+    def _mouse4(self, e):
+        if not self.images: return
+        r = get_rating_from_name(self.images[self.index])
+        self.rate_image(1 if r is None else r+1)
+
+    def _mouse5(self, e):
+        if not self.images: return
+        r = get_rating_from_name(self.images[self.index])
+        self.rate_image(0 if r is None else max(0,r-1))
+
+    def _on_canvas_wheel(self, event):
+        # Single event: no double-stepping. Delta >0 = scroll up = prev image.
+        if event.delta > 0: self.prev_image()
+        else: self.next_image()
+
+    # ── Folder loading ────────────────────────────────────────────────────────
+
+    def open_folder(self):
+        def _default_dir():
+            d = self._settings.get("default_folder", DEFAULT_FOLDER)
+            if os.path.isdir(d): return d
+            if os.path.isdir(DEFAULT_FOLDER): return DEFAULT_FOLDER
+            return os.path.expanduser("~")
+        start = self.folder or _default_dir()
+        picker = FilePicker(self, start_dir=start, settings=self._settings)
+        self.wait_window(picker)
+        if not picker.result_folder: return
+        self.folder = picker.result_folder
+        sort_mode = getattr(picker, "result_sort", None)
+        if sort_mode == "quick":
+            # Run sort silently with saved rules, then load from index 0
+            _run_sort_quick(self.folder, self._settings)
+            self.load_folder(start_index=0)
+        elif sort_mode == "custom":
+            # Load folder first, then open sort dialog (which auto-closes after sort)
+            self.load_folder(start_index=0)
+            def _reload():
+                self.load_folder(start_index=0)
+            SortDialog(self, self.folder, self._settings, reload_cb=_reload)
+        else:
+            self.load_folder(start_index=0, target_file=getattr(picker, "result_file", None))
+
+    def load_folder(self, start_index=0, target_file=None):
+        files = []
+        for root, dirs, fnames in os.walk(self.folder):
+            dirs.sort()
+            for f in sorted(fnames):
+                if f.lower().endswith(".png"):
+                    files.append(os.path.relpath(os.path.join(root,f), self.folder))
+        if self._flat_mode:
+            self.images = sort_files(files, self.folder, self._sort_method)
+        else:
+            groups = defaultdict(list)
+            for rel in files: groups[os.path.dirname(rel)].append(rel)
+            ordered = []
+            for d in sorted(groups.keys()):
+                ordered.extend(sort_files(groups[d], self.folder, self._sort_method))
+            self.images = ordered
+        if not self.images:
+            messagebox.showinfo("No Images","No PNG files found."); return
+        if target_file:
+            # Find the index of the specifically chosen file
+            for i, rel in enumerate(self.images):
+                if os.path.basename(rel) == target_file:
+                    start_index = i; break
+        self.index = min(start_index, len(self.images)-1)
+        self.show_image()
+
+    # ── Thumbnail browser ─────────────────────────────────────────────────────
+
+    def open_thumb_browser(self):
+        # If no folder open, open folder picker first
+        if not self.folder or not self.images:
+            d = self._settings.get("default_folder", DEFAULT_FOLDER)
+            start = d if os.path.isdir(d) else (DEFAULT_FOLDER if os.path.isdir(DEFAULT_FOLDER) else os.path.expanduser("~"))
+            picker = FilePicker(self, start_dir=start, settings=self._settings)
+            self.wait_window(picker)
+            if not picker.result_folder: return
+            self.folder = picker.result_folder
+            self.load_folder(start_index=picker.result_index)
+            if not self.images: return
+
+        initial_sel = self.images[self.index] if self.images else None
+        browser = ThumbnailBrowser(self, self.folder, list(self.images),
+                                    self._settings,
+                                    jump_cb=self._jump_to_image,
+                                    rename_cb=self._on_tb_rename,
+                                    initial_sel=initial_sel)
+        browser.protocol("WM_DELETE_WINDOW", lambda: self._on_browser_close(browser))
+        self._thumb_browser = browser
+
+    def _on_tb_rename(self, old_rel, new_rel):
+        """Keep ImageRater.images in sync when TB renames a file."""
+        try:
+            idx = self.images.index(old_rel)
+            self.images[idx] = new_rel
+            # If we're currently showing the renamed image, update index tracking
+            if self.index == idx:
+                pass  # index stays the same; show_image will use updated name
+        except ValueError:
+            pass
+
+    def _jump_to_image(self, rel):
+        # Exact match first
+        if rel in self.images:
+            self.index = self.images.index(rel)
+        else:
+            # Fall back to strip-prefix comparison (handles renamed files)
+            rel_stripped = strip_prefix(os.path.basename(rel))
+            for idx, r in enumerate(self.images):
+                if strip_prefix(os.path.basename(r)) == rel_stripped:
+                    self.index = idx; break
+        self.show_image()
+        self.lift(); self.focus_force()
+
+    def _on_browser_close(self, browser):
+        browser.destroy(); self._thumb_browser = None
+        if self.folder: self.load_folder(start_index=self.index)
+
+    # ── Navigation ────────────────────────────────────────────────────────────
+
+    def next_image(self):
+        if not self.images: return
+        self.index = (self.index+1) % len(self.images); self.show_image()
+
+    def prev_image(self):
+        if not self.images: return
+        self.index = (self.index-1) % len(self.images); self.show_image()
+
+    def _open_subfolder_dialog(self):
+        if not self.folder: messagebox.showinfo("No Folder","Open a folder first."); return
+        def _ir_jump_idx(idx):
+            self.index = idx; self.show_image()
+        SubfolderDialog(self, self.folder, self.images, self._jump_to_subfolder,
+                        self._settings, jump_to_idx_cb=_ir_jump_idx)
+
+    def _jump_to_subfolder(self, subdir):
+        for idx,rel in enumerate(self.images):
+            if os.path.dirname(rel) == subdir:
+                self.index = idx; self.show_image(); return
+
+    # ── Display ──────────────────────────────────────────────────────────────
+
+    def show_image(self):
+        if not self.images: return
+        rel      = self.images[self.index]
+        basename = os.path.basename(rel)
+        dirpart  = os.path.dirname(rel)
+        if self._auto_prefix and is_unrated(basename):
+            rel = self._apply_unrated_prefix(rel)
+        path = os.path.join(self.folder, rel)
+        try:
+            self._orig_image = Image.open(path)
+        except Exception as ex:
+            messagebox.showerror("Error",f"Could not open image:\n{ex}"); return
+        self._zoom = 1.0; self._fit = True
+        self.fit_btn.config(relief=tk.SUNKEN)
+        self._redisplay(); self._update_info()
+
+    def _apply_unrated_prefix(self, rel):
+        dirpart  = os.path.dirname(rel)
+        basename = os.path.basename(rel)
+        new_base = UNRATED_PREFIX + basename
+        new_rel  = os.path.join(dirpart, new_base) if dirpart else new_base
+        try:
+            os.rename(os.path.join(self.folder,rel), os.path.join(self.folder,new_rel))
+            self.images[self.index] = new_rel
+            return new_rel
+        except Exception as ex:
+            messagebox.showerror("Rename Error",str(ex)); return rel
+
+    def _update_info(self):
+        rel      = self.images[self.index]
+        dirpart  = os.path.dirname(rel)
+        basename = os.path.basename(rel)
+        w, h     = self._orig_image.size
+        rating   = get_rating_from_name(basename)
+
+        # Title: containing_folder / subfolder(if any) / filename
+        folder_name = os.path.basename(self.folder) if self.folder else ""
+        if dirpart:
+            display = f"{folder_name}/{dirpart}/{basename}"
+        else:
+            display = f"{folder_name}/{basename}"
+        self.title(display)
+        self.index_label.config(text=f"{self.index+1}/{len(self.images)}")
+        self.res_label.config(text=f"{w}×{h}")
+        self.star_label.config(text=f"★ {rating}/5" if rating is not None else "·  ·")
+
+        if dirpart and not self._flat_mode:
+            sub_imgs = [i for i,r in enumerate(self.images) if os.path.dirname(r)==dirpart]
+            sub_pos  = sub_imgs.index(self.index)+1 if self.index in sub_imgs else "?"
+            self.subdir_index_label.config(text=f"{sub_pos}/{len(sub_imgs)}")
+            short = dirpart if len(dirpart)<=10 else dirpart[:8]+"…"
+            self.subdir_name_label.config(text=short)
+        elif dirpart and self._flat_mode:
+            short = dirpart if len(dirpart)<=10 else dirpart[:8]+"…"
+            self.subdir_index_label.config(text="")
+            self.subdir_name_label.config(text=f"[{short}]")
+        else:
+            self.subdir_index_label.config(text="")
+            self.subdir_name_label.config(text="")
+
+        self._highlight_rating_button(rating)
+        self._apply_bar_color(rating)
+        # Update open comment dialog if any
+        if hasattr(self, "_comment_dlg") and self._comment_dlg:
+            try:
+                if self._comment_dlg.winfo_exists():
+                    self._comment_dlg.update_image(os.path.join(self.folder, rel))
+            except Exception: self._comment_dlg = None
+
+    def _apply_bar_color(self, rating):
+        """Recolor only the toolbar container frames to match current rating.
+        Buttons keep their own colors; we only color the bare backgrounds."""
+        bar_color = rating_color(rating) if rating is not None else BG_PANEL
+        dk        = _darken(bar_color,0.7) if rating is not None else "#555555"
+
+        # Left toolbar: frame itself + spacer (buttons are in fixed-color boxes)
+        try: self._left_toolbar.config(bg=bar_color)
+        except Exception: pass
+        try: self._lt_spacer.config(bg=bar_color)
+        except Exception: pass
+
+        # Bottom rating bar
+        if self._rbar_state == self.RBAR_BOTTOM:
+            self._rbar_outer.config(bg=bar_color)
+            self._rbar.config(bg=bar_color)
+            self._handle.config(bg=dk)
+            for row_frame in self._rbar.winfo_children():
+                try: row_frame.config(bg=bar_color)
+                except Exception: pass
+                for cell in row_frame.winfo_children():
+                    try: cell.config(bg=bar_color)
+                    except Exception: pass
+        # Sidebar
+        elif self._rbar_state == self.RBAR_SIDEBAR:
+            # Only recolor bg, don't touch size
+            self._rbar_sidebar_frame.config(bg=bar_color)
+
+    def _open_settings(self):
+        SettingsDialog(self, self._settings)
+
+    def _update_title(self):
+        self.title("Image Rater")
+
+    def _highlight_rating_button(self, active_rating):
+        for r,btn in self._rating_buttons.items():
+            base = RATING_COLORS[r]
+            if r == active_rating:
+                btn.config(bg=base, fg=_rating_fg(r), highlightthickness=3,
+                           highlightbackground="#ffffff", highlightcolor="#ffffff")
+            else:
+                btn.config(bg=_darken(base,0.5), fg=_rating_fg(r), highlightthickness=0)
+        for r,btn in self._sidebar_btns.items():
+            base = RATING_COLORS[r]
+            if r == active_rating:
+                btn.config(bg=base, fg=_rating_fg(r), highlightthickness=3,
+                           highlightbackground="#ffffff", highlightcolor="#ffffff")
+            else:
+                btn.config(bg=_darken(base,0.5), fg=_rating_fg(r), highlightthickness=0)
+
+    def _redisplay(self):
+        if not hasattr(self,"_orig_image") or self._orig_image is None: return
+        cw = self.canvas.winfo_width(); ch = self.canvas.winfo_height()
+        if cw < 2 or ch < 2: return
+        img    = self._orig_image.copy()
+        iw, ih = img.size
+        scale  = min(cw/iw, ch/ih, 1.0) if self._fit else self._zoom
+        nw, nh = max(1,int(iw*scale)), max(1,int(ih*scale))
+        img    = img.resize((nw,nh), Image.LANCZOS)
+        self._photo = ImageTk.PhotoImage(img)
+        self.canvas.delete("all")
+        self.canvas.create_image(cw//2, ch//2, anchor=tk.CENTER, image=self._photo)
+
+    def zoom(self, factor):
+        self._fit = False; self.fit_btn.config(relief=tk.FLAT)
+        self._zoom *= factor; self._redisplay()
+
+    def toggle_fit(self):
+        self._fit = not self._fit
+        self.fit_btn.config(relief=tk.SUNKEN if self._fit else tk.FLAT)
+        if self._fit: self._zoom = 1.0
+        self._redisplay()
+
+    # ── Rating ────────────────────────────────────────────────────────────────
+
+    def rate_image(self, rating):
+        if not self.images: return
+        rel      = self.images[self.index]
+        dirpart  = os.path.dirname(rel)
+        basename = os.path.basename(rel)
+        new_base = rating_prefix(rating) + strip_prefix(basename)
+        new_rel  = os.path.join(dirpart, new_base) if dirpart else new_base
+        if new_rel != rel:
+            try:
+                os.rename(os.path.join(self.folder,rel), os.path.join(self.folder,new_rel))
+            except Exception as ex:
+                messagebox.showerror("Rename Error",str(ex)); return
+            self.images[self.index] = new_rel
+        self._update_info()
+        if self._rbar_state == self.RBAR_BOTTOM:
+            self._build_rating_bar()
+        elif self._rbar_state == self.RBAR_SIDEBAR:
+            self._build_rating_sidebar()
+
+    # ── Utilities ─────────────────────────────────────────────────────────────
+
+    def _delete_trash(self):
+        if not self.folder: return
+        trash = []
+        for rel in self.images:
+            if get_rating_from_name(os.path.basename(rel)) == 0:
+                trash.append(rel)
+        if not trash:
+            messagebox.showinfo("Delete Trash","No rating-0 files found."); return
+        if not messagebox.askyesno("Delete Trash",
+                f"Permanently delete {len(trash)} file(s) rated 0?",parent=self): return
+        for rel in trash:
+            try: os.remove(os.path.join(self.folder,rel))
+            except Exception: pass
+        self.load_folder(start_index=min(self.index, max(0,len(self.images)-len(trash)-1)))
+
+    def _open_sort_dialog(self):
+        if not self.folder: messagebox.showinfo("No Folder","Open a folder first."); return
+        current = self.images[self.index] if self.images else None
+        def _reload():
+            self.load_folder(start_index=0)
+        SortDialog(self, self.folder, self._settings, reload_cb=_reload)
+
+    def _open_explorer(self):
+        if not self.folder: return
+        rel = self.images[self.index] if self.images else ""
+        open_in_explorer(os.path.join(self.folder,rel) if rel else self.folder)
+
+    def _show_comment(self):
+        if not self.images: messagebox.showinfo("No Image","No image loaded."); return
+        rel   = self.images[self.index]
+        fpath = os.path.join(self.folder, rel)
+        if hasattr(self, "_comment_dlg") and self._comment_dlg and self._comment_dlg.winfo_exists():
+            self._comment_dlg.update_image(fpath)
+            self._comment_dlg.lift()
+        else:
+            self._comment_dlg = show_comment_dialog(
+                self, fpath, self._settings,
+                on_close=lambda: setattr(self, "_comment_dlg", None))
+
+    def _move_files(self):
+        if not self.folder: messagebox.showinfo("No Folder","Open a folder first."); return
+        def done():
+            self.folder = None; self.images = []
+            self._update_title()
+            self.after(100, self.open_folder)
+        MoveFilesDialog(self, self.folder, self._settings, done)
+
+    def _pick_sort(self): OrderDialog(self, self._sort_method, self._apply_sort, self._settings)
+
+    def _apply_sort(self, method):
+        self._sort_method = method
+        self._settings["sort_method"] = method; save_settings(self._settings)
+        if self.folder: self.load_folder(start_index=self.index)
+
+    def _rate_unrated_as_trash(self):
+        if not self.folder: return
+        count = 0
+        for i,rel in enumerate(self.images):
+            basename = os.path.basename(rel)
+            if has_unrated_prefix(basename):
+                dirpart  = os.path.dirname(rel)
+                new_base = RATING_PREFIXES[0] + strip_prefix(basename)
+                new_rel  = os.path.join(dirpart,new_base) if dirpart else new_base
+                try:
+                    os.rename(os.path.join(self.folder,rel),
+                              os.path.join(self.folder,new_rel))
+                    self.images[i] = new_rel; count += 1
+                except Exception: pass
+        if count:
+            messagebox.showinfo("Done",f"Rated {count} '-' file(s) as 0.")
+            self._update_info()
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import traceback
+    try:
+        app = ImageRater()
+
+        def _root_scroll(e):
+            try:
+                if isinstance(e.widget.winfo_toplevel(), tk.Toplevel):
+                    return
+            except Exception: pass
+            app._on_canvas_wheel(e)
+
+        app.bind("<MouseWheel>", _root_scroll)
+        app.mainloop()
+    except Exception:
+        err = traceback.format_exc()
+        try:
+            import tkinter as _tk
+            from tkinter import messagebox as _mb
+            _r = _tk.Tk(); _r.withdraw()
+            _mb.showerror("Image Rater – Startup Error", err)
+            _r.destroy()
+        except Exception: pass
+        raise
