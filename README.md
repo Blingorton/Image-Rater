@@ -1,12 +1,22 @@
+All of this has been vibe-coded with the free version of Claude for Stable Diffusion ReForge with python 3.10 to work on my machine. I barely know how to do 'pip install'. I can't help troubleshoot anything if you have issues. If you're having trouble, your best bet is to paste the code into into a new chat with your own free account with Claude and get it to fix it to work on your machine (it will probably help to tell it what version of python you have and which flavor of Stable Diffusion you're using while doing so). Again, I have absolutely no idea what I'm doing.
+
 This image browser is modeled after Irfanview, optimized for sifting though thousands of generated images. Using this program has greatly increased my ability to actually engage with my generations and pick out the best ones.
 The program keeps track of everything by adding prefixes to image names. A viewed but unrated image will get a "-" prefix as soon as it's opened by the program (You can use the green A:- button to toggle this feature off). This feature is intended to help keep track of everything you've at least looked at, and helps with clean up steps from other features.
-The UI will change color based on rating for easier clarity while browsing following videogame loot colors. Images can be rated from 0 to 5, getting corrisponding prefixes and colors:
+The UI will change color based on rating for easier clarity while browsing following videogame loot colors. Images can be rated from 0 to 5, getting corresponding prefixes and colors:
+
 0: zzz_trash (red)
+
 1: = (white)
+
 2: _ (green)
+
 3: __ (blue)
+
 4: ___ (purple)
+
 5: ____ (orange)
+
+
 Ratings can go beyond 5, continuing to add underscores to the title. This is intended to make higher rated images appear first when browsing through the folder in windows explorer.
 Ratings can be assigned by using the rating toolbar, number buttons on keyboard, or mouse 4 and mouse 5 for better 1 handed rating.
 
