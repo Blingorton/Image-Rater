@@ -62,3 +62,5 @@ Cycle rating toolbar (top, side, hidden)
 
 Thumbnail Viewer
 the thumbnail viewer is also very extensive, mirroring most of the main browser's functions. the main differences are that actions are applied to whatever thumbnail you've clicked on, and the auto prefix with '-' function is replaced with a button that can add or remove that prefix to all images in the folder instead.
+
+UPDATE: Added a search function which makes it only show images with the searched term in the metadata. this function also has the ability to temporarily disable the automatic "-" prefix when in use, disableding it by default. Updated some of the highlighting behavior for the comment window.
